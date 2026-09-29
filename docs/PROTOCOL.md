@@ -31,12 +31,30 @@ Sent once by the client right after the TCP connection is established.
 Payload: UTF-8 JSON, e.g.
 
 ```json
-{ "name": "Emma's iPhone", "app": "LensLink", "protocol": 1, "kind": "camera" }
+{ "name": "Emma's iPhone", "deviceID": "B1092868-1234-5678-ABCD-0123456789AB",
+  "app": "LensLink", "protocol": 1, "kind": "camera" }
 ```
+
+`name` is the phone's display name — for status lines only; the user can
+rename the phone at any time.
 
 `kind` is `"camera"` (the app) or `"screen"` (the screen-mirror broadcast
 extension); it lets the plugin label the source and, for `screen`, expect
 system audio (packet type 10) instead of camera controls. Absent = camera.
+
+`deviceID` (optional) is the installation's persistent identity — see
+[Device identity](#device-identity). Apps older than the field omit it;
+plugins older than it ignore it, like any unknown key. A value that isn't
+a UUID in 8-4-4-4-12 hex form (either case; the app sends upper case) is
+treated exactly as if it were absent. It is the same for the app and the
+broadcast extension, so it identifies the phone, not the stream: `kind`
+still says what this connection carries.
+
+The plugin parses HELLO strictly: a syntax error, a payload over 4 KiB, or
+a known key given twice makes the whole packet malformed (read as an
+unnamed camera with no identity), while a wrong-typed field is ignored on
+its own. A string holding an escaped `\u0000` is never cut short at the
+NUL — it is treated as absent.
 
 An optional `"standby": true` means the app is reachable but the camera
 isn't running yet (the app is open and idle with its **Remote start from
@@ -374,6 +392,37 @@ field. Only the PTR answer's instance label and the responder's source
 address are used — the wire port is fixed — so no SRV/A parsing or
 multicast group membership is required. Typing an IP directly still
 works exactly as before.
+
+## Device identity
+
+Each LensLink installation owns one random UUID, its **deviceID**,
+generated once by the app (`Sources/LensLinkIdentity.swift`) and reused
+forever after. It is what lets an OBS source find *the same phone* again
+after a DHCP move, a rename, a Wi-Fi reconnect, or an OBS restart.
+
+| Concept | Scope | Changes when | Used for |
+|---|---|---|---|
+| deviceID | the app installation | the app is deleted and reinstalled | binding a source to a phone |
+| phone name (HELLO `name`) | the phone | the user renames it | status text |
+| IP address | the network | DHCP, a new network | dialing — a cache, never identity |
+| `kind` | one connection | the user switches camera ↔ screen broadcast | routing to Camera/Screen sources |
+| source runtime id (web API `id`) | one OBS session | every OBS launch | addressing a live source in the web API |
+| OBS source name | the scene collection | the user renames the source | the production role ("Stage Left") |
+
+The deviceID is not derived from the hardware or the network — no serial
+number, MAC or IP address, advertising identifier, or
+`identifierForVendor` — and it never leaves the local network: it goes
+only to the plugin, in HELLO. The app keeps
+it in a file in the App Group container it shares with the broadcast
+extension, so both present the same identity; the file is excluded from
+backups, so restoring a backup onto another phone does not clone it. A
+build without the App Group entitlement (an unsigned or re-signed
+sideload) keeps the id in the app's own storage, and its broadcast
+extension then sends none rather than a second, different one.
+
+The deviceID is an identifier, not a credential: anything on the LAN can
+claim any id. It protects against *accidents* — a stale address now
+belonging to another phone — not against an attacker.
 
 ## USB transport
 

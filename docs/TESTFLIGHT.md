@@ -35,6 +35,19 @@ repository secret**, four times:
    `…LensLinkCamera.broadcast` automatically on first run).
 3. SKU: anything, e.g. `lenslink`.
 
+### The App Group
+
+Both targets carry the App Group `group.com.exaltedpixels.LensLinkCamera`
+(`ios-app/project.yml`), where the app and the broadcast extension share
+the installation's device identity (`docs/PROTOCOL.md`, "Device
+identity"). Automatic signing with `-allowProvisioningUpdates` normally
+registers the group and enables it on both App IDs by itself. If the
+first upload after the group was added fails with a provisioning-profile
+error about App Groups, the API key can't create identifiers: register
+the group once under **Certificates, Identifiers & Profiles →
+Identifiers → App Groups**, enable **App Groups** with it on both App
+IDs (`…LensLinkCamera` and `…LensLinkCamera.broadcast`), and re-run.
+
 ## 4. Run it
 
 - Manually: **Actions → TestFlight → Run workflow**, or

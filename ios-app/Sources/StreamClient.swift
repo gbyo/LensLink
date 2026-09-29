@@ -29,6 +29,15 @@ final class StreamClient {
         didSet { onStateChange?(state) }
     }
 
+    /// This installation's persistent identity (LensLinkIdentity), sent in
+    /// HELLO so a bound OBS source can confirm it reached the right phone.
+    /// Owned by the caller, not the transport; nil sends none.
+    let deviceID: String?
+
+    init(deviceID: String?) {
+        self.deviceID = deviceID
+    }
+
     private var connection: NWConnection?
     private var listener: NWListener?
     private let queue = DispatchQueue(label: "obscam.network")
@@ -480,6 +489,11 @@ final class StreamClient {
         ]
         if standbyMode {
             hello["standby"] = true
+        }
+        // Absent when there is none: older plugins ignore the key, and
+        // an unbound source never asks for it.
+        if let deviceID {
+            hello["deviceID"] = deviceID
         }
         guard let payload = try? JSONSerialization.data(withJSONObject: hello) else { return }
         send(OBSCProtocol.packet(type: .hello, payload: payload))

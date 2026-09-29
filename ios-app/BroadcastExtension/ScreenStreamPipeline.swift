@@ -7,7 +7,9 @@ final class ScreenStreamPipeline {
     var onFatalError: ((String) -> Void)?
     var onConnectionChange: ((Bool) -> Void)?
 
-    private let client = StreamClient()
+    /// Same identity as the app (App Group storage): one phone, one
+    /// device id, whichever of the two is streaming.
+    private let client = StreamClient(deviceID: LensLinkIdentity.deviceID)
     private var encoder: VideoEncoder?
     private var configuredWidth: Int32 = 0
     private var configuredHeight: Int32 = 0

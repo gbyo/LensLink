@@ -200,7 +200,10 @@ the raw captures are gone.
 **Data Not Collected.** The app makes no network requests except to
 the user's own OBS on the local network; the only outbound links are to
 GitHub (bug reports, source) and open in Safari. No analytics, no
-crash reporting SDK, no identifiers.
+crash reporting SDK, no identifiers collected. The random installation
+id the app announces to OBS (`docs/PROTOCOL.md`, "Device identity") is
+created on the phone, isn't derived from the device, and never leaves
+the user's own network — it is not collected in App Store terms.
 
 ## Export compliance
 

@@ -79,6 +79,14 @@ targets:
           - CFBundleURLName: com.exaltedpixels.LensLinkCamera
             CFBundleURLSchemes:
               - lenslink
+    # The App Group lets the app and the broadcast extension share one
+    # persistent device identity (Sources/LensLinkIdentity.swift). Both
+    # entitlements files are generated from these properties.
+    entitlements:
+      path: Sources/LensLink.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.com.exaltedpixels.LensLinkCamera
     settings:
       base:
         # Explicit (not derived from bundleIdPrefix): com.exaltedpixels.LensLink
@@ -112,6 +120,7 @@ targets:
       - path: Sources/StreamClient.swift
       - path: Sources/VideoEncoder.swift
       - path: Sources/Localization.swift
+      - path: Sources/LensLinkIdentity.swift
     info:
       path: BroadcastExtension/Info.plist
       properties:
@@ -126,6 +135,11 @@ targets:
           NSExtensionPointIdentifier: com.apple.broadcast-services-upload
           NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).SampleHandler
           RPBroadcastProcessMode: RPBroadcastProcessModeSampleBuffer
+    entitlements:
+      path: BroadcastExtension/LensLinkBroadcast.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.com.exaltedpixels.LensLinkCamera
     settings:
       base:
         # Must be a child of the app's bundle id.

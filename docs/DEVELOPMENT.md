@@ -36,6 +36,7 @@ obs-plugin/            C plugin for OBS Studio (CMake)
 ios-app/               SwiftUI companion app (XcodeGen project)
   Sources/VideoEncoder.swift    VideoToolbox encode + AVCC→Annex B
   Sources/StreamClient.swift    Network.framework listener + framing
+  Sources/LensLinkIdentity.swift  the installation's persistent deviceID (App Group)
   Sources/AudioReference.swift  mic capture for lip-sync reference
   Sources/StreamingView.swift   full-screen streaming UI + camera controls
   Sources/Localization.swift    L() lookup, shared with the broadcast extension

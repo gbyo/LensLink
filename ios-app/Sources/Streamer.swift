@@ -1205,7 +1205,7 @@ final class Streamer: ObservableObject {
 
     let camera = CameraManager()
     private var encoder: VideoEncoder?
-    private let client = StreamClient()
+    private let client = StreamClient(deviceID: LensLinkIdentity.deviceID)
     private var audioReference: AudioReference?
 
     /// The green screen compositor — exists exactly while armed (green

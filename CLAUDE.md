@@ -111,7 +111,8 @@ cd ios-app && xcodegen generate && open LensLink.xcodeproj
 New files under `Sources/` are picked up automatically, but anything the
 **broadcast extension** also needs must be listed explicitly under
 `LensLinkBroadcast.sources` in `ios-app/project.yml` (today: `Protocol.swift`,
-`StreamClient.swift`, `VideoEncoder.swift`, `Localization.swift`). Details (signing, older Xcode):
+`StreamClient.swift`, `VideoEncoder.swift`, `Localization.swift`,
+`LensLinkIdentity.swift`). Details (signing, older Xcode):
 `ios-app/BUILDING.md`.
 
 ### Localized strings: check (works in this Linux environment)

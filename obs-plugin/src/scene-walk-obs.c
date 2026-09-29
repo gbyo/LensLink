@@ -6,7 +6,7 @@
 extern struct obs_source_info ios_camera_source_info;
 extern struct obs_source_info lenslink_screen_source_info;
 
-static bool is_lenslink_source(const obs_source_t *source)
+bool lenslink_is_lenslink_source(const obs_source_t *source)
 {
 	const char *id = obs_source_get_id(source);
 	return id && (strcmp(id, ios_camera_source_info.id) == 0 ||
@@ -35,7 +35,7 @@ static bool enum_trampoline(obs_scene_t *scene, obs_sceneitem_t *item,
 		out.container = obs_group_from_source(source);
 	} else if (obs_scene_from_source(source)) {
 		out.container = obs_scene_from_source(source);
-	} else if (is_lenslink_source(source)) {
+	} else if (lenslink_is_lenslink_source(source)) {
 		const char *uuid = obs_source_get_uuid(source);
 		if (uuid && uuid[0])
 			out.lenslink_uuid = uuid;

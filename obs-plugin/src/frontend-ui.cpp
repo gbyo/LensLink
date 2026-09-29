@@ -1,22 +1,38 @@
 /*
  * Frontend UI: a live health readout in OBS's status bar (fps · Mb/s ·
- * latency, next to OBS's own stats) plus a "LensLink" dock with one row
- * per source, fed by the snapshots ios-camera-source.c keeps anyway.
+ * latency, next to OBS's own stats) plus the LensLink dock — a compact
+ * strip of camera cards (rig-dock.cpp) driven by the rig model
+ * (rig-model.c) from the snapshots ios-camera-source.c keeps anyway.
  *
- * Two deliberate choices keep this portable and optional:
+ * Deliberate choices that keep this portable and optional:
  *
  * - The obs-frontend-api symbols are resolved AT RUNTIME from the running
  *   process (dlsym / GetProcAddress). The plugin never links the frontend
  *   library — the same binary loads in OBS builds without a frontend
  *   (headless, older) and the UI just stays off. Only the header is
- *   needed at compile time, for the types.
- * - No Q_OBJECT: the timer binds a lambda, so no moc, and the plugin's
- *   plain CMake stays plain.
+ *   needed at compile time, for the types. Every symbol beyond the three
+ *   the UI can't exist without is optional: without the Studio Mode calls
+ *   nothing is ever PVW, without save callbacks the order isn't
+ *   persisted, and so on — never a crash at module load.
+ * - No Q_OBJECT: timers and cross-thread posts bind lambdas, so no moc,
+ *   and the plugin's plain CMake stays plain.
+ * - This layer owns only wiring. What the operator sees is decided by
+ *   rig-model.c (pure, tested); how it is drawn is rig-dock.cpp; which
+ *   sources are in OBS Preview is scene-walk-obs.c.
  *
- * Everything here runs on the Qt UI thread (frontend event callbacks and
- * the QTimer both live there). State comes only from the shared source
- * registry (source-registry.h), which locks internally and addresses
- * sources by id — never a pointer into a source.
+ * Everything here runs on the Qt UI thread. libobs signal callbacks can
+ * arrive on any thread (transitions activate sources on the graphics
+ * thread), so they only *post* a coalesced refresh to the UI thread; they
+ * never touch a widget. State comes from the shared source registry
+ * (source-registry.h), which locks internally and addresses sources by id
+ * — never a pointer into a source — and from the frontend's Preview scene
+ * queried afresh on every refresh; no OBS pointer is kept between calls.
+ *
+ * Refresh cadence: the numbers (fps, bitrate, latency, battery) ride the
+ * existing 1 s timer. Program/Preview/collection changes don't wait for
+ * it: frontend events and libobs's source signals request a refresh at
+ * once. The timer also re-derives Preview, which is what notices a scene
+ * item being hidden inside the Preview scene (no event announces that).
  */
 
 #include <obs-module.h>
@@ -31,6 +47,7 @@
 #include <QGuiApplication>
 #include <QLabel>
 #include <QMainWindow>
+#include <QMetaObject>
 #include <QPushButton>
 #include <QSpinBox>
 #include <QStatusBar>
@@ -38,10 +55,16 @@
 #include <QTimer>
 #include <QVBoxLayout>
 
+#include <atomic>
+#include <memory>
 #include <vector>
+
+#include "rig-dock.h"
 
 extern "C" {
 #include "diagnostics.h"
+#include "rig-model.h"
+#include "scene-walk-obs.h"
 #include "source-registry.h"
 #include "plugin-settings.h"
 void lenslink_frontend_init(void);
@@ -58,6 +81,13 @@ namespace {
 
 constexpr char DOCK_ID[] = "lenslink_health";
 
+/* Where this module keeps its data inside the scene collection's
+ * "modules" object (save callbacks): modules.lenslink.dock.order. */
+constexpr char SAVE_KEY[] = "lenslink";
+constexpr char SAVE_DOCK[] = "dock";
+constexpr char SAVE_ORDER[] = "order";
+constexpr int SAVE_VERSION = 1;
+
 /* Runtime-resolved frontend API (see file comment). */
 struct FrontendApi {
 	void (*add_event_callback)(obs_frontend_event_cb, void *);
@@ -66,10 +96,17 @@ struct FrontendApi {
 	bool (*add_dock_by_id)(const char *, const char *, void *);
 	void (*remove_dock)(const char *);
 	void (*add_tools_menu_item)(const char *, obs_frontend_cb, void *);
+	/* Optional: each only gates the feature that needs it. */
+	bool (*preview_program_mode_active)(void);
+	obs_source_t *(*get_current_preview_scene)(void);
+	void (*add_save_callback)(obs_frontend_save_cb, void *);
+	void (*remove_save_callback)(obs_frontend_save_cb, void *);
+	void (*open_source_properties)(obs_source_t *);
 };
 
 FrontendApi api = {};
 bool callback_installed = false;
+bool save_callback_installed = false;
 
 template<typename T> void resolve(T &fn, const char *name)
 {
@@ -84,8 +121,25 @@ template<typename T> void resolve(T &fn, const char *name)
 }
 
 QLabel *status_label = nullptr;
-QLabel *dock_label = nullptr; /* owned by OBS once the dock is added */
+lenslink::RigDock *dock = nullptr; /* owned by OBS once the dock is added */
 QTimer *timer = nullptr;
+
+/* The dock's whole state, all of it copies and UUID strings: nothing here
+ * points into OBS. Reset wholesale when the scene collection changes. */
+lenslink_rig rig;
+lenslink_uuid_set preview_set;
+bool studio_mode = false;
+bool collection_busy = false; /* between CHANGING and CHANGED: no queries */
+std::unique_ptr<lenslink_rig_view> view;
+std::vector<lenslink_source_info> snapshot;
+size_t snapshot_count = 0;
+
+/* Cross-thread refresh requests (libobs signals): coalesced into one
+ * queued call on the UI thread. `post_target` is nulled before the
+ * signals are disconnected. */
+std::atomic<bool> refresh_pending{false};
+std::atomic<QObject *> post_target{nullptr};
+signal_handler_t *signals_handler = nullptr;
 
 /* Rates come derived from the dial loop (one computation shared by every
  * surface); "…" until a decode stream has two samples. */
@@ -102,16 +156,58 @@ QString rates_text(const lenslink_source_info &h)
 	return text;
 }
 
-void refresh()
+/* Which LensLink sources are visible through Studio Mode's Preview scene.
+ * Empty (and `studio_mode` false) outside Studio Mode — the canvas of
+ * plain single-view OBS has no Preview. A scene that can't be walked
+ * safely leaves the set empty: no PVW beats a false PVW. */
+void update_preview()
 {
-	if (!status_label)
+	preview_set.count = 0;
+	studio_mode = false;
+	if (!api.preview_program_mode_active ||
+	    !api.get_current_preview_scene || !api.preview_program_mode_active())
 		return;
 
-	std::vector<lenslink_source_info> list(LENSLINK_MAX_SOURCES);
-	size_t count = lenslink_source_enum(list.data(), list.size());
+	studio_mode = true;
+	obs_source_t *scene = api.get_current_preview_scene();
+	if (!scene)
+		return;
+	lenslink_preview_collect(scene, &preview_set);
+	obs_source_release(scene);
+}
+
+const char *module_text(const char *key)
+{
+	return obs_module_text(key);
+}
+
+/* Rebuilds the model from the last snapshot and applies it to the dock.
+ * Cheap (no allocation beyond the widgets' own text), so a click or a
+ * reorder can call it directly. */
+void render()
+{
+	if (!dock || !view)
+		return;
+	lenslink_rig_build(&rig, snapshot.data(), snapshot_count,
+			   studio_mode ? &preview_set : nullptr, view.get());
+	dock->apply(*view);
+}
+
+void refresh()
+{
+	if (!status_label || collection_busy)
+		return;
+
+	if (snapshot.empty())
+		snapshot.resize(LENSLINK_MAX_SOURCES);
+	snapshot_count = lenslink_source_enum(snapshot.data(), snapshot.size());
+	const lenslink_source_info *list = snapshot.data();
+	size_t count = snapshot_count;
+
+	update_preview();
+	render();
 
 	QStringList bar_parts;
-	QStringList dock_rows;
 	int standby_count = 0;
 
 	for (size_t i = 0; i < count; i++) {
@@ -125,23 +221,6 @@ void refresh()
 		} else if (h.connected && h.standby) {
 			standby_count++;
 		}
-
-		/* Dock: every source gets a row, live or not. */
-		QString detail;
-		if (h.connected && !h.standby)
-			detail = rates_text(h);
-		else
-			detail = QString::fromUtf8(h.status).toHtmlEscaped();
-		dock_rows << QStringLiteral("<b>%1</b>%2<br/>%3")
-				     .arg(QString::fromUtf8(h.source_name)
-						  .toHtmlEscaped(),
-					  h.device_name[0] ? QStringLiteral(
-							      " — %1")
-							      .arg(QString::fromUtf8(
-									   h.device_name)
-									   .toHtmlEscaped())
-						      : QString(),
-					  detail);
 	}
 
 	/* Status bar: live streams get numbers; standby-only gets a word;
@@ -159,16 +238,215 @@ void refresh()
 	} else {
 		status_label->setVisible(false);
 	}
+}
 
-	if (dock_label) {
-		dock_label->setText(
-			dock_rows.isEmpty()
-				? QStringLiteral("<i>%1</i>")
-					  .arg(QString::fromUtf8(obs_module_text(
-							       "HealthDock.Empty"))
-						       .toHtmlEscaped())
-				: dock_rows.join(
-					  QStringLiteral("<br/><br/>")));
+/* Asks for a refresh from any thread. Many requests in one burst (a
+ * transition activates and deactivates several sources) become one call
+ * on the UI thread, which by then sees the settled state. */
+void request_refresh()
+{
+	QObject *target = post_target.load();
+	if (!target || refresh_pending.exchange(true))
+		return;
+	QMetaObject::invokeMethod(
+		target,
+		[] {
+			refresh_pending.store(false);
+			refresh();
+		},
+		Qt::QueuedConnection);
+}
+
+/* libobs signal callback — any thread. Only filters and posts. */
+void source_signal(void *, calldata_t *cd)
+{
+	obs_source_t *source = nullptr;
+	calldata_get_ptr(cd, "source", &source);
+	if (source && lenslink_is_lenslink_source(source))
+		request_refresh();
+}
+
+void connect_signals()
+{
+	signals_handler = obs_get_signal_handler();
+	if (!signals_handler)
+		return;
+	/* Program: a source becoming or ceasing to be part of the final
+	 * mix, through any nesting, and both sides of a transition. Plus
+	 * the lifecycle events the 1 s timer would otherwise be the first
+	 * to notice. */
+	static const char *const names[] = {"source_activate",
+					    "source_deactivate",
+					    "source_create", "source_destroy",
+					    "source_rename"};
+	for (const char *name : names)
+		signal_handler_connect(signals_handler, name, source_signal,
+				       nullptr);
+}
+
+void disconnect_signals()
+{
+	post_target.store(nullptr);
+	if (!signals_handler)
+		return;
+	static const char *const names[] = {"source_activate",
+					    "source_deactivate",
+					    "source_create", "source_destroy",
+					    "source_rename"};
+	/* Blocks until any callback already running has returned. */
+	for (const char *name : names)
+		signal_handler_disconnect(signals_handler, name, source_signal,
+					  nullptr);
+	signals_handler = nullptr;
+}
+
+/* --- persistence: the camera order, per scene collection ---------------- */
+
+/* Save/load callback. Runs on the UI thread with the scene collection's
+ * "modules" object. Loading replaces the order with the collection's own
+ * (or none); saving writes only cameras that exist right now, in slot
+ * order, keyed by OBS source UUID. */
+void save_callback(obs_data_t *data, bool saving, void *)
+{
+	if (saving) {
+		if (collection_busy)
+			return; /* mid-switch: the registry is half a collection */
+
+		if (snapshot.empty())
+			snapshot.resize(LENSLINK_MAX_SOURCES);
+		size_t n = lenslink_source_enum(snapshot.data(),
+						snapshot.size());
+		const char *present[LENSLINK_MAX_SOURCES];
+		size_t np = 0;
+		for (size_t i = 0; i < n; i++)
+			if (snapshot[i].uuid[0])
+				present[np++] = snapshot[i].uuid;
+
+		char ordered[LENSLINK_RIG_MAX][LENSLINK_UUID_SIZE];
+		size_t count = lenslink_rig_order_export(&rig.order, present,
+							 np, ordered,
+							 LENSLINK_RIG_MAX);
+
+		obs_data_t *root = obs_data_create();
+		obs_data_t *dock_data = obs_data_create();
+		obs_data_array_t *order = obs_data_array_create();
+		for (size_t i = 0; i < count; i++) {
+			obs_data_t *item = obs_data_create();
+			obs_data_set_string(item, "uuid", ordered[i]);
+			obs_data_array_push_back(order, item);
+			obs_data_release(item);
+		}
+		obs_data_set_array(dock_data, SAVE_ORDER, order);
+		obs_data_set_obj(root, SAVE_DOCK, dock_data);
+		obs_data_set_int(root, "version", SAVE_VERSION);
+		obs_data_set_obj(data, SAVE_KEY, root);
+		obs_data_array_release(order);
+		obs_data_release(dock_data);
+		obs_data_release(root);
+		return;
+	}
+
+	lenslink_rig_order_clear(&rig.order);
+	rig.selected[0] = '\0';
+	rig.selected_slot = 0;
+
+	obs_data_t *root = obs_data_get_obj(data, SAVE_KEY);
+	if (!root)
+		return;
+	if (obs_data_get_int(root, "version") == SAVE_VERSION) {
+		obs_data_t *dock_data = obs_data_get_obj(root, SAVE_DOCK);
+		obs_data_array_t *order =
+			dock_data ? obs_data_get_array(dock_data, SAVE_ORDER)
+				  : nullptr;
+		if (order) {
+			char saved[LENSLINK_RIG_MAX][LENSLINK_UUID_SIZE];
+			const char *ptrs[LENSLINK_RIG_MAX];
+			size_t n = 0;
+			size_t total = obs_data_array_count(order);
+			for (size_t i = 0; i < total && n < LENSLINK_RIG_MAX;
+			     i++) {
+				obs_data_t *item = obs_data_array_item(order, i);
+				const char *uuid =
+					obs_data_get_string(item, "uuid");
+				if (uuid && uuid[0]) {
+					snprintf(saved[n], sizeof(saved[n]),
+						 "%s", uuid);
+					ptrs[n] = saved[n];
+					n++;
+				}
+				obs_data_release(item);
+			}
+			lenslink_rig_order_import(&rig.order, ptrs, n);
+			obs_data_array_release(order);
+		}
+		if (dock_data)
+			obs_data_release(dock_data);
+	}
+	obs_data_release(root);
+}
+
+/* --- dock actions -------------------------------------------------------- */
+
+void dock_select(const QString &uuid)
+{
+	if (!view)
+		return;
+	/* Dock-local state only; no OBS scene, preview or transition is
+	 * touched by choosing a camera. */
+	if (lenslink_rig_select(&rig, view.get(), uuid.toUtf8().constData()))
+		render();
+}
+
+void dock_move(const QString &uuid, int delta)
+{
+	if (!view)
+		return;
+	const QByteArray key = uuid.toUtf8();
+	bool screen = false;
+	const char *keys[LENSLINK_MAX_SOURCES];
+	size_t n = 0;
+	for (size_t i = 0; i < view->count; i++)
+		if (strcmp(view->cards[i].uuid, key.constData()) == 0)
+			screen = view->cards[i].is_screen;
+	/* Neighbours are the cards of the same kind, in slot order. */
+	for (size_t i = 0; i < view->count; i++)
+		if (view->cards[i].is_screen == screen)
+			keys[n++] = view->cards[i].uuid;
+	if (lenslink_rig_order_move(&rig.order, keys, n, key.constData(),
+				    delta))
+		render();
+}
+
+void dock_action(uint32_t id, lenslink::CardAction action)
+{
+	switch (action) {
+	case lenslink::CardAction::Start:
+		lenslink_source_stream_command(id, LENSLINK_STREAM_START);
+		break;
+	case lenslink::CardAction::Pause:
+		lenslink_source_stream_command(id, LENSLINK_STREAM_PAUSE);
+		break;
+	case lenslink::CardAction::Resume:
+		lenslink_source_stream_command(id, LENSLINK_STREAM_RESUME);
+		break;
+	case lenslink::CardAction::Stop:
+		lenslink_source_stream_command(id, LENSLINK_STREAM_STOP);
+		break;
+	case lenslink::CardAction::Recalibrate:
+		lenslink_source_recalibrate(id);
+		break;
+	}
+}
+
+void dock_open_properties(uint32_t id)
+{
+	if (!api.open_source_properties)
+		return;
+	/* A strong reference for the duration of the call, by id: the
+	 * source may have been destroyed since the card was drawn. */
+	if (obs_source_t *source = lenslink_source_get_obs_source(id)) {
+		api.open_source_properties(source);
+		obs_source_release(source);
 	}
 }
 
@@ -183,30 +461,38 @@ void create_widgets()
 	status_label->setVisible(false);
 	window->statusBar()->addPermanentWidget(status_label);
 
+	view.reset(new lenslink_rig_view());
+
 	if (api.add_dock_by_id) {
-		dock_label = new QLabel;
-		dock_label->setTextFormat(Qt::RichText);
-		dock_label->setAlignment(Qt::AlignTop | Qt::AlignLeft);
-		dock_label->setWordWrap(true);
-		dock_label->setContentsMargins(10, 8, 10, 8);
-		if (!api.add_dock_by_id(DOCK_ID,
-					obs_module_text("HealthDock"),
-					dock_label)) {
-			delete dock_label;
-			dock_label = nullptr;
+		lenslink::DockCallbacks callbacks;
+		callbacks.select = dock_select;
+		callbacks.move = dock_move;
+		callbacks.open_properties = dock_open_properties;
+		callbacks.action = dock_action;
+		dock = new lenslink::RigDock(callbacks);
+		if (!api.add_dock_by_id(DOCK_ID, obs_module_text("HealthDock"),
+					dock)) {
+			delete dock;
+			dock = nullptr;
 		}
 	}
 
 	timer = new QTimer(window);
 	QObject::connect(timer, &QTimer::timeout, [] { refresh(); });
 	timer->start(1000);
+	post_target.store(timer);
+	connect_signals();
+	refresh();
 
 	blog(LOG_INFO, "[lenslink] frontend UI ready (status bar%s)",
-	     dock_label ? " + dock" : "");
+	     dock ? " + dock" : "");
 }
 
 void destroy_widgets()
 {
+	/* Signals first: after this returns no libobs thread can post to
+	 * the timer or reach a widget. */
+	disconnect_signals();
 	if (timer) {
 		timer->stop();
 		timer->deleteLater();
@@ -220,12 +506,13 @@ void destroy_widgets()
 		status_label->deleteLater();
 		status_label = nullptr;
 	}
-	if (dock_label) {
+	if (dock) {
 		/* OBS owns the widget; removing the dock destroys it. */
 		if (api.remove_dock)
 			api.remove_dock(DOCK_ID);
-		dock_label = nullptr;
+		dock = nullptr;
 	}
+	view.reset();
 }
 
 /* Tools -> "LensLink Settings": the plugin-wide switches that never made
@@ -343,6 +630,43 @@ void frontend_event(enum obs_frontend_event event, void *)
 	case OBS_FRONTEND_EVENT_EXIT:
 		destroy_widgets();
 		break;
+
+	/* A new scene collection is a new rig: forget the old one's order,
+	 * selection and Preview before the sources it names are destroyed,
+	 * and don't query anything until the new collection is loaded. The
+	 * new collection's own order arrives through the load callback,
+	 * which runs between CLEANUP and CHANGED. */
+	case OBS_FRONTEND_EVENT_SCENE_COLLECTION_CHANGING:
+	case OBS_FRONTEND_EVENT_SCENE_COLLECTION_CLEANUP:
+		collection_busy = true;
+		lenslink_rig_reset(&rig);
+		preview_set.count = 0;
+		studio_mode = false;
+		snapshot_count = 0;
+		if (dock)
+			dock->clear();
+		break;
+	case OBS_FRONTEND_EVENT_SCENE_COLLECTION_CHANGED:
+		collection_busy = false;
+		request_refresh();
+		break;
+
+	/* Tally: what is on air / in Preview changed. Requested rather than
+	 * run inline so OBS has finished updating its own state first. */
+	case OBS_FRONTEND_EVENT_SCENE_CHANGED:
+	case OBS_FRONTEND_EVENT_PREVIEW_SCENE_CHANGED:
+	case OBS_FRONTEND_EVENT_STUDIO_MODE_ENABLED:
+	case OBS_FRONTEND_EVENT_STUDIO_MODE_DISABLED:
+	case OBS_FRONTEND_EVENT_TRANSITION_CHANGED:
+	case OBS_FRONTEND_EVENT_TRANSITION_STOPPED:
+	case OBS_FRONTEND_EVENT_SCENE_LIST_CHANGED:
+		request_refresh();
+		break;
+
+	case OBS_FRONTEND_EVENT_THEME_CHANGED:
+		if (dock)
+			dock->restyle();
+		break;
 	default:
 		break;
 	}
@@ -359,6 +683,14 @@ void lenslink_frontend_init(void)
 	resolve(api.add_dock_by_id, "obs_frontend_add_dock_by_id");
 	resolve(api.remove_dock, "obs_frontend_remove_dock");
 	resolve(api.add_tools_menu_item, "obs_frontend_add_tools_menu_item");
+	resolve(api.preview_program_mode_active,
+		"obs_frontend_preview_program_mode_active");
+	resolve(api.get_current_preview_scene,
+		"obs_frontend_get_current_preview_scene");
+	resolve(api.add_save_callback, "obs_frontend_add_save_callback");
+	resolve(api.remove_save_callback, "obs_frontend_remove_save_callback");
+	resolve(api.open_source_properties,
+		"obs_frontend_open_source_properties");
 
 	if (!api.add_event_callback || !api.remove_event_callback ||
 	    !api.get_main_window) {
@@ -371,6 +703,15 @@ void lenslink_frontend_init(void)
 	api.add_event_callback(frontend_event, nullptr);
 	callback_installed = true;
 
+	/* The order must be registered before the first scene collection
+	 * loads (modules load first), so it is installed here, not with the
+	 * widgets. Without the API the order simply isn't persisted. */
+	lenslink_rig_init(&rig, module_text);
+	if (api.add_save_callback && api.remove_save_callback) {
+		api.add_save_callback(save_callback, nullptr);
+		save_callback_installed = true;
+	}
+
 	if (api.add_tools_menu_item)
 		api.add_tools_menu_item(obs_module_text("Settings.MenuItem"),
 					show_settings_dialog, nullptr);
@@ -381,6 +722,10 @@ void lenslink_frontend_shutdown(void)
 	if (callback_installed) {
 		api.remove_event_callback(frontend_event, nullptr);
 		callback_installed = false;
+	}
+	if (save_callback_installed) {
+		api.remove_save_callback(save_callback, nullptr);
+		save_callback_installed = false;
 	}
 	/* Widgets are torn down on OBS_FRONTEND_EVENT_EXIT, which precedes
 	 * module unload; nothing further to do here. */

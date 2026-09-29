@@ -152,7 +152,8 @@ if(ENABLE_FRONTEND_UI)
   if(Qt6_FOUND AND OBS_FRONTEND_API_INCLUDE_DIR)
     set_target_properties(${PROJECT_NAME} PROPERTIES
       CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
-    target_sources(${PROJECT_NAME} PRIVATE src/frontend-ui.cpp)
+    target_sources(${PROJECT_NAME} PRIVATE src/frontend-ui.cpp
+                                           src/rig-dock.cpp src/rig-dock.h)
     target_compile_definitions(${PROJECT_NAME} PRIVATE LENSLINK_FRONTEND)
     target_include_directories(${PROJECT_NAME} PRIVATE
       ${OBS_FRONTEND_API_INCLUDE_DIR})

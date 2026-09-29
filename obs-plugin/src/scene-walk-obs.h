@@ -17,6 +17,9 @@
 extern "C" {
 #endif
 
+/* True for a LensLink Camera or Screen source. Safe from any thread. */
+bool lenslink_is_lenslink_source(const obs_source_t *source);
+
 /* Collects the UUIDs of every LensLink Camera/Screen source that is
  * visible through `scene_source`: present as a scene item, with the item
  * and every group / nested-scene item above it visible. `scene_source`

@@ -14,8 +14,9 @@
  *   plain CMake stays plain.
  *
  * Everything here runs on the Qt UI thread (frontend event callbacks and
- * the QTimer both live there); the only cross-thread traffic is
- * lenslink_health_enum, which locks internally.
+ * the QTimer both live there). State comes only from the shared source
+ * registry (source-registry.h), which locks internally and addresses
+ * sources by id — never a pointer into a source.
  */
 
 #include <obs-module.h>
@@ -37,12 +38,11 @@
 #include <QTimer>
 #include <QVBoxLayout>
 
-#include <string>
-#include <unordered_map>
+#include <vector>
 
 extern "C" {
 #include "diagnostics.h"
-#include "health.h"
+#include "source-registry.h"
 #include "plugin-settings.h"
 void lenslink_frontend_init(void);
 void lenslink_frontend_shutdown(void);
@@ -56,7 +56,6 @@ void lenslink_frontend_shutdown(void);
 
 namespace {
 
-constexpr int MAX_SOURCES = 16;
 constexpr char DOCK_ID[] = "lenslink_health";
 
 /* Runtime-resolved frontend API (see file comment). */
@@ -88,27 +87,16 @@ QLabel *status_label = nullptr;
 QLabel *dock_label = nullptr; /* owned by OBS once the dock is added */
 QTimer *timer = nullptr;
 
-/* Rate derivation: previous cumulative counters per source name. */
-struct PrevSample {
-	uint64_t frames;
-	uint64_t bytes;
-	uint64_t time_ns;
-};
-std::unordered_map<std::string, PrevSample> previous;
-
-QString rates_text(const lenslink_health &h, const PrevSample *prev,
-		   uint64_t now_ns)
+/* Rates come derived from the dial loop (one computation shared by every
+ * surface); "…" until a decode stream has two samples. */
+QString rates_text(const lenslink_source_info &h)
 {
-	if (!prev || now_ns <= prev->time_ns || h.frames < prev->frames)
+	if (!h.has_rates)
 		return QStringLiteral("…");
 
-	double seconds = double(now_ns - prev->time_ns) / 1e9;
-	double fps = double(h.frames - prev->frames) / seconds;
-	double mbps = double(h.bytes - prev->bytes) * 8.0 / seconds / 1e6;
-
 	QString text = QStringLiteral("%1 fps · %2 Mb/s")
-			       .arg(qRound(fps))
-			       .arg(mbps, 0, 'f', 1);
+			       .arg(qRound(h.fps))
+			       .arg(h.bitrate_bps / 1e6, 0, 'f', 1);
 	if (h.latency_ms > 0)
 		text += QStringLiteral(" · %1 ms").arg(h.latency_ms);
 	return text;
@@ -119,29 +107,21 @@ void refresh()
 	if (!status_label)
 		return;
 
-	lenslink_health list[MAX_SOURCES];
-	size_t count = lenslink_health_enum(list, MAX_SOURCES);
-	uint64_t now = os_gettime_ns();
+	std::vector<lenslink_source_info> list(LENSLINK_MAX_SOURCES);
+	size_t count = lenslink_source_enum(list.data(), list.size());
 
 	QStringList bar_parts;
 	QStringList dock_rows;
-	std::unordered_map<std::string, PrevSample> next;
 	int standby_count = 0;
 
 	for (size_t i = 0; i < count; i++) {
-		const lenslink_health &h = list[i];
-		std::string key = h.source_name;
-		const PrevSample *prev = nullptr;
-		auto it = previous.find(key);
-		if (it != previous.end())
-			prev = &it->second;
-		next[key] = {h.frames, h.bytes, now};
+		const lenslink_source_info &h = list[i];
 
 		QString who = QString::fromUtf8(
 			h.device[0] ? h.device : h.source_name);
 		if (h.connected && !h.standby) {
 			bar_parts << QStringLiteral("%1 %2").arg(
-				who, rates_text(h, prev, now));
+				who, rates_text(h));
 		} else if (h.connected && h.standby) {
 			standby_count++;
 		}
@@ -149,7 +129,7 @@ void refresh()
 		/* Dock: every source gets a row, live or not. */
 		QString detail;
 		if (h.connected && !h.standby)
-			detail = rates_text(h, prev, now);
+			detail = rates_text(h);
 		else
 			detail = QString::fromUtf8(h.status).toHtmlEscaped();
 		dock_rows << QStringLiteral("<b>%1</b>%2<br/>%3")
@@ -163,7 +143,6 @@ void refresh()
 						      : QString(),
 					  detail);
 	}
-	previous = std::move(next);
 
 	/* Status bar: live streams get numbers; standby-only gets a word;
 	 * nothing LensLink → no label at all (don't crowd OBS's bar). */
@@ -247,7 +226,6 @@ void destroy_widgets()
 			api.remove_dock(DOCK_ID);
 		dock_label = nullptr;
 	}
-	previous.clear();
 }
 
 /* Tools -> "LensLink Settings": the plugin-wide switches that never made

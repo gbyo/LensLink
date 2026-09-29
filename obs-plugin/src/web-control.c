@@ -11,6 +11,7 @@
 
 #include "net-compat.h"
 #include "web-control.h"
+#include "source-registry.h"
 #include "plugin-settings.h"
 #include "diagnostics.h"
 
@@ -548,39 +549,29 @@ struct web_control {
 	uint16_t port;
 };
 
-/* One server, many sources. The registry maps small stable ids (what
- * ?src= carries) to live sources; handlers resolve a source and use it
- * entirely under the mutex, so once unregister returns, no request can
- * touch that source again. Registration happens on the UI thread;
- * lookups on the (single) web thread. */
-#define WC_MAX_SOURCES 16
+/* One server, many sources — the sources themselves live in the shared
+ * source registry (source-registry.h), which owns ids and lifetime; this
+ * file only runs the server. `server` is guarded by g_server_mutex, which
+ * request handlers never take (they only call the registry), so stopping
+ * the server can never deadlock against a request in flight. */
+static pthread_mutex_t g_server_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct web_control *g_server;
 
-static struct {
-	pthread_mutex_t mutex;
-	struct web_control *server;
-	struct {
-		int id;
-		struct ios_camera_source *src;
-	} entries[WC_MAX_SOURCES];
-	size_t count;
-	int next_id;
-} g_reg = {.mutex = PTHREAD_MUTEX_INITIALIZER, .next_id = 1};
-
-/* ?src=<id> on the request line picks a source; no (or an unknown) id
- * falls back to the first registered one, so single-source setups and
- * scripts written before multi-source keep working unchanged. Caller
- * holds g_reg.mutex. */
-static struct ios_camera_source *locked_pick_source(const char *request)
+/* ?src=<id> on the request line picks a camera source; no (or an
+ * unknown) id falls back to the first camera source, so single-source
+ * setups and scripts written before multi-source keep working
+ * unchanged. Returns 0 when no camera source exists. */
+static uint32_t pick_source(const char *request)
 {
 	const char *nl = strpbrk(request, "\r\n");
 	const char *q = strstr(request, "src=");
+	uint32_t id = 0;
 	if (q && nl && q < nl) {
-		int id = atoi(q + 4);
-		for (size_t i = 0; i < g_reg.count; i++)
-			if (g_reg.entries[i].id == id)
-				return g_reg.entries[i].src;
+		long v = strtol(q + 4, NULL, 10);
+		if (v > 0)
+			id = (uint32_t)v;
 	}
-	return g_reg.count ? g_reg.entries[0].src : NULL;
+	return lenslink_source_resolve_camera(id);
 }
 
 static void set_timeouts(socket_t s, int seconds)
@@ -863,29 +854,36 @@ static void handle_client(socket_t client)
 	}
 
 	if (strncmp(request, "GET /api/sources", 16) == 0) {
-		char json[4096];
-		size_t o = (size_t)snprintf(json, sizeof(json),
-					    "{\"sources\":[");
-		pthread_mutex_lock(&g_reg.mutex);
-		for (size_t i = 0; i < g_reg.count && o + 384 < sizeof(json);
-		     i++) {
-			struct ios_camera_source *s = g_reg.entries[i].src;
-			char name[128], esc[280];
-			ios_camera_copy_name(s, name, sizeof(name));
-			json_escape(name, esc, sizeof(esc));
-			o += (size_t)snprintf(
-				json + o, sizeof(json) - o,
-				"%s{\"id\":%d,\"name\":\"%s\","
-				"\"connected\":%s,\"standby\":%s,"
-				"\"screen\":%s}",
-				i ? "," : "", g_reg.entries[i].id, esc,
-				ios_camera_is_connected(s) ? "true" : "false",
-				ios_camera_is_standby(s) ? "true" : "false",
-				ios_camera_is_screen(s) ? "true" : "false");
+		/* Camera sources only: screen mirrors have nothing to control
+		 * here. "screen" is what the live connection carries. */
+		struct lenslink_source_info *list =
+			bmalloc(sizeof(*list) * LENSLINK_MAX_SOURCES);
+		size_t count = lenslink_source_enum(list, LENSLINK_MAX_SOURCES);
+		struct dstr json = {0};
+		bool first = true;
+		dstr_copy(&json, "{\"sources\":[");
+		for (size_t i = 0; i < count; i++) {
+			const struct lenslink_source_info *h = &list[i];
+			if (h->is_screen)
+				continue;
+			char esc[280];
+			json_escape(h->source_name[0] ? h->source_name
+						      : "LensLink",
+				    esc, sizeof(esc));
+			dstr_catf(&json,
+				  "%s{\"id\":%u,\"name\":\"%s\","
+				  "\"connected\":%s,\"standby\":%s,"
+				  "\"screen\":%s}",
+				  first ? "" : ",", (unsigned)h->id, esc,
+				  h->connected ? "true" : "false",
+				  h->standby ? "true" : "false",
+				  h->stream_is_screen ? "true" : "false");
+			first = false;
 		}
-		pthread_mutex_unlock(&g_reg.mutex);
-		snprintf(json + o, sizeof(json) - o, "]}");
-		respond(client, "200 OK", "application/json", json);
+		dstr_cat(&json, "]}");
+		bfree(list);
+		respond(client, "200 OK", "application/json", json.array);
+		dstr_free(&json);
 		return;
 	}
 
@@ -893,12 +891,9 @@ static void handle_client(socket_t client)
 		/* Must fit the source's whole device_state cache (2048) —
 		 * truncation here would hand the panel unparsable JSON. */
 		char state[2048] = {0};
-		pthread_mutex_lock(&g_reg.mutex);
-		struct ios_camera_source *s = locked_pick_source(request);
-		if (s)
-			ios_camera_copy_state(s, state, sizeof(state));
-		pthread_mutex_unlock(&g_reg.mutex);
-		if (!s) {
+		uint32_t id = pick_source(request);
+		if (!id || !lenslink_source_copy_state_json(id, state,
+							    sizeof(state))) {
 			respond(client, "503 Service Unavailable",
 				"text/plain", "no sources");
 			return;
@@ -908,40 +903,27 @@ static void handle_client(socket_t client)
 	}
 
 	if (strncmp(request, "GET /api/status", 15) == 0) {
-		char status[1024] = {0};
 		char escaped[2048] = {0};
 		char json[2304];
-		enum ios_camera_status_tone tone = STATUS_TONE_IDLE;
-		bool screen = false, standby = false, connected = false;
-		bool auto_start = false;
-		const char *sync = "off";
-
-		pthread_mutex_lock(&g_reg.mutex);
-		struct ios_camera_source *s = locked_pick_source(request);
-		if (s) {
-			ios_camera_copy_status(s, status, sizeof(status),
-					       &tone);
-			screen = ios_camera_is_screen(s);
-			standby = ios_camera_is_standby(s);
-			connected = ios_camera_is_connected(s);
-			auto_start = ios_camera_auto_start(s);
-			sync = ios_camera_sync_state(s);
-		}
-		pthread_mutex_unlock(&g_reg.mutex);
-		if (!s) {
+		struct lenslink_source_info *h = bzalloc(sizeof(*h));
+		uint32_t id = pick_source(request);
+		if (!id || !lenslink_source_get_info(id, h)) {
+			bfree(h);
 			respond(client, "503 Service Unavailable",
 				"text/plain", "no sources");
 			return;
 		}
-		json_escape(status, escaped, sizeof(escaped));
+		json_escape(h->status, escaped, sizeof(escaped));
 		snprintf(json, sizeof(json),
 			 "{\"status\":\"%s\",\"tone\":\"%s\",\"screen\":%s,"
 			 "\"standby\":%s,\"connected\":%s,\"autoStart\":%s,"
 			 "\"sync\":\"%s\"}",
-			 escaped, tone_name(tone), screen ? "true" : "false",
-			 standby ? "true" : "false",
-			 connected ? "true" : "false",
-			 auto_start ? "true" : "false", sync);
+			 escaped, tone_name(h->tone),
+			 h->stream_is_screen ? "true" : "false",
+			 h->standby ? "true" : "false",
+			 h->connected ? "true" : "false",
+			 h->auto_start ? "true" : "false", h->sync);
+		bfree(h);
 		respond(client, "200 OK", "application/json", json);
 		return;
 	}
@@ -955,28 +937,20 @@ static void handle_client(socket_t client)
 				"body required");
 			return;
 		}
-		pthread_mutex_lock(&g_reg.mutex);
-		struct ios_camera_source *s = locked_pick_source(request);
-		if (s)
-			ios_camera_set_auto_start(
-				s,
-				strstr(request + body_offset, "true") != NULL);
-		pthread_mutex_unlock(&g_reg.mutex);
-		respond(client, s ? "204 No Content" : "503 Service Unavailable",
-			"text/plain", s ? NULL : "no sources");
+		bool ok = lenslink_source_set_auto_start(
+			pick_source(request),
+			strstr(request + body_offset, "true") != NULL);
+		respond(client, ok ? "204 No Content" : "503 Service Unavailable",
+			"text/plain", ok ? NULL : "no sources");
 		return;
 	}
 
 	if (strncmp(request, "POST /api/recalibrate", 21) == 0) {
 		/* Drops the locked lip-sync mic figure and measures afresh —
 		 * the panel's Recalibrate button. No body. */
-		pthread_mutex_lock(&g_reg.mutex);
-		struct ios_camera_source *s = locked_pick_source(request);
-		if (s)
-			ios_camera_recalibrate(s);
-		pthread_mutex_unlock(&g_reg.mutex);
-		respond(client, s ? "204 No Content" : "503 Service Unavailable",
-			"text/plain", s ? NULL : "no sources");
+		bool ok = lenslink_source_recalibrate(pick_source(request));
+		respond(client, ok ? "204 No Content" : "503 Service Unavailable",
+			"text/plain", ok ? NULL : "no sources");
 		return;
 	}
 
@@ -986,14 +960,11 @@ static void handle_client(socket_t client)
 				"body required");
 			return;
 		}
-		pthread_mutex_lock(&g_reg.mutex);
-		struct ios_camera_source *s = locked_pick_source(request);
-		if (s)
-			ios_camera_enqueue_control(s, request + body_offset,
-						   content_length);
-		pthread_mutex_unlock(&g_reg.mutex);
-		respond(client, s ? "204 No Content" : "503 Service Unavailable",
-			"text/plain", s ? NULL : "no sources");
+		bool ok = lenslink_source_send_control(pick_source(request),
+						       request + body_offset,
+						       content_length);
+		respond(client, ok ? "204 No Content" : "503 Service Unavailable",
+			"text/plain", ok ? NULL : "no sources");
 		return;
 	}
 
@@ -1083,23 +1054,23 @@ static void server_stop(struct web_control *wc)
 }
 
 /* Reconcile the singleton server with the plugin-wide settings and the
- * registry: running while (enabled && any source), on the settings'
- * port. The server to stop is detached under the mutex but joined
- * outside it — a request handler blocked on g_reg.mutex must be able to
- * finish, or the join would deadlock. */
+ * registry: running while (enabled && any camera source), on the
+ * settings' port. The server to stop is detached under the mutex but
+ * joined outside it. */
 void web_control_apply_settings(void)
 {
 	struct web_control *to_stop = NULL;
 	uint16_t port = (uint16_t)lenslink_settings_web_port();
+	bool want = lenslink_settings_web_enabled() &&
+		    lenslink_source_camera_count() > 0;
 
-	pthread_mutex_lock(&g_reg.mutex);
-	bool want = lenslink_settings_web_enabled() && g_reg.count > 0;
-	if (g_reg.server && (!want || g_reg.server->port != port)) {
-		to_stop = g_reg.server;
-		g_reg.server = NULL;
+	pthread_mutex_lock(&g_server_mutex);
+	if (g_server && (!want || g_server->port != port)) {
+		to_stop = g_server;
+		g_server = NULL;
 	}
-	bool need_start = want && !g_reg.server;
-	pthread_mutex_unlock(&g_reg.mutex);
+	bool need_start = want && !g_server;
+	pthread_mutex_unlock(&g_server_mutex);
 
 	if (to_stop)
 		server_stop(to_stop);
@@ -1109,59 +1080,26 @@ void web_control_apply_settings(void)
 	struct web_control *wc = server_start(port);
 	if (!wc)
 		return;
-	pthread_mutex_lock(&g_reg.mutex);
-	if (!g_reg.server && g_reg.count > 0) {
-		g_reg.server = wc;
+	/* Re-check under the mutex: a concurrent apply (the last camera
+	 * source being destroyed, the setting turned off) may have run
+	 * while this server was starting. */
+	pthread_mutex_lock(&g_server_mutex);
+	if (!g_server && lenslink_settings_web_enabled() &&
+	    lenslink_source_camera_count() > 0) {
+		g_server = wc;
 		wc = NULL;
 	}
-	pthread_mutex_unlock(&g_reg.mutex);
-	if (wc) /* raced with another apply, or the registry emptied */
+	pthread_mutex_unlock(&g_server_mutex);
+	if (wc) /* raced with another apply, or nothing left to serve */
 		server_stop(wc);
-}
-
-void web_control_register(struct ios_camera_source *source)
-{
-	pthread_mutex_lock(&g_reg.mutex);
-	for (size_t i = 0; i < g_reg.count; i++) {
-		if (g_reg.entries[i].src == source) {
-			pthread_mutex_unlock(&g_reg.mutex);
-			return;
-		}
-	}
-	if (g_reg.count < WC_MAX_SOURCES) {
-		g_reg.entries[g_reg.count].id = g_reg.next_id++;
-		g_reg.entries[g_reg.count].src = source;
-		g_reg.count++;
-	} else {
-		blog(LOG_WARNING,
-		     "[lenslink] web control: more than %d sources; "
-		     "extra sources won't appear in the panel",
-		     WC_MAX_SOURCES);
-	}
-	pthread_mutex_unlock(&g_reg.mutex);
-}
-
-void web_control_unregister(struct ios_camera_source *source)
-{
-	pthread_mutex_lock(&g_reg.mutex);
-	for (size_t i = 0; i < g_reg.count; i++) {
-		if (g_reg.entries[i].src == source) {
-			memmove(&g_reg.entries[i], &g_reg.entries[i + 1],
-				(g_reg.count - i - 1) *
-					sizeof(g_reg.entries[0]));
-			g_reg.count--;
-			break;
-		}
-	}
-	pthread_mutex_unlock(&g_reg.mutex);
 }
 
 void web_control_shutdown(void)
 {
-	pthread_mutex_lock(&g_reg.mutex);
-	struct web_control *to_stop = g_reg.server;
-	g_reg.server = NULL;
-	pthread_mutex_unlock(&g_reg.mutex);
+	pthread_mutex_lock(&g_server_mutex);
+	struct web_control *to_stop = g_server;
+	g_server = NULL;
+	pthread_mutex_unlock(&g_server_mutex);
 	server_stop(to_stop);
 
 	pthread_mutex_lock(&g_page_mutex);

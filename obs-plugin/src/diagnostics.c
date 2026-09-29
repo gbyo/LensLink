@@ -6,7 +6,7 @@
 #include <string.h>
 
 #include "diagnostics.h"
-#include "health.h"
+#include "source-registry.h"
 #include "plugin-settings.h"
 #include "net-compat.h"
 
@@ -165,13 +165,15 @@ static const char *dial_error_meaning(int err)
 
 static void append_sources(struct dstr *d)
 {
-	struct lenslink_health h[16];
-	size_t n = lenslink_health_enum(h, 16);
+	struct lenslink_source_info *h =
+		bmalloc(sizeof(*h) * LENSLINK_MAX_SOURCES);
+	size_t n = lenslink_source_enum(h, LENSLINK_MAX_SOURCES);
 
 	dstr_cat(d, "== Sources ==\n");
 	if (n == 0) {
 		dstr_cat(d, "(none — no LensLink source exists in this "
 			    "scene collection)\n\n");
+		bfree(h);
 		return;
 	}
 
@@ -229,6 +231,7 @@ static void append_sources(struct dstr *d)
 		}
 		dstr_cat(d, "\n");
 	}
+	bfree(h);
 }
 
 char *lenslink_diagnostics_report(void)

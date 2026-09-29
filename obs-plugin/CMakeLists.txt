@@ -65,6 +65,9 @@ add_library(${PROJECT_NAME} MODULE
   src/plugin-settings.c
   src/gpu-frame.c
   src/pipeline-bench.c
+  src/source-registry.c
+  src/camera-state.c
+  src/json-reader.c
   src/protocol.h
   src/web-control.h
   src/lipsync.h
@@ -73,6 +76,9 @@ add_library(${PROJECT_NAME} MODULE
   src/h264-decoder.h
   src/usbmux.h
   src/mdns.h
+  src/source-registry.h
+  src/camera-state.h
+  src/json-reader.h
 )
 
 target_link_libraries(${PROJECT_NAME} PRIVATE OBS::libobs ${FFMPEG_TARGET})
@@ -131,7 +137,7 @@ if(ENABLE_FRONTEND_UI)
   if(Qt6_FOUND AND OBS_FRONTEND_API_INCLUDE_DIR)
     set_target_properties(${PROJECT_NAME} PROPERTIES
       CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
-    target_sources(${PROJECT_NAME} PRIVATE src/frontend-ui.cpp src/health.h)
+    target_sources(${PROJECT_NAME} PRIVATE src/frontend-ui.cpp)
     target_compile_definitions(${PROJECT_NAME} PRIVATE LENSLINK_FRONTEND)
     target_include_directories(${PROJECT_NAME} PRIVATE
       ${OBS_FRONTEND_API_INCLUDE_DIR})
@@ -145,6 +151,16 @@ if(ENABLE_FRONTEND_UI)
 endif()
 
 set_target_properties(${PROJECT_NAME} PROPERTIES PREFIX "")
+
+# --- unit tests (optional) ---------------------------------------------------
+# Standalone tests for the plugin's pure logic (STATE parsing, the JSON
+# reader, source-registry lifetime). Off by default so plugin builds and
+# CI are unchanged: cmake -DLENSLINK_BUILD_TESTS=ON, then ctest.
+option(LENSLINK_BUILD_TESTS "Build the plugin's unit tests" OFF)
+if(LENSLINK_BUILD_TESTS)
+  enable_testing()
+  add_subdirectory(tests)
+endif()
 
 # --- install ---------------------------------------------------------------
 # Default layout matches a Linux system-wide OBS install; override

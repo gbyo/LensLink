@@ -24,11 +24,14 @@ Contributor and maintainer notes. End-user documentation is in the
 obs-plugin/            C plugin for OBS Studio (CMake)
   src/protocol.h       wire-protocol constants + header parsing
   src/ios-camera-source.c   the OBS source: dial loop, latency, lip sync
+  src/source-registry.c     live sources + the one read/control API every surface uses
+  src/camera-state.c   typed camera STATE, parsed once per snapshot (json-reader.c)
   src/h264-decoder.c   libavcodec H.264/HEVC → obs_source_frame (GPU-capable)
   src/usbmux.c         usbmuxd client (USB transport)
   src/web-control.c    browser control panel (http://localhost:9980)
   src/diagnostics.c    the pasteable diagnostics report (Tools menu, /api/diagnostics)
   src/lipsync.c        audio cross-correlation for lip-sync calibration
+  tests/               opt-in unit tests for pure logic (-DLENSLINK_BUILD_TESTS=ON)
   data/locale/         en-US.ini (source) + one .ini per language
 ios-app/               SwiftUI companion app (XcodeGen project)
   Sources/VideoEncoder.swift    VideoToolbox encode + AVCC→Annex B

@@ -4,52 +4,19 @@
  * DroidCam-style. Serves on 127.0.0.1 only; control commands are queued
  * onto the addressed source and forwarded to the device over the stream
  * connection.
+ *
+ * One server, many sources. Sources come from the shared source registry
+ * (source-registry.h) — the same one the Qt dock and diagnostics read —
+ * and requests address a camera source with the ?src= id listed by
+ * /api/sources; no id means the first camera source, so single-source
+ * setups and older scripts work unchanged.
  */
 
 #pragma once
 
-#include <stdint.h>
-#include <stdbool.h>
-
-struct ios_camera_source;
-
-enum ios_camera_status_tone {
-	STATUS_TONE_IDLE,
-	STATUS_TONE_WAIT,
-	STATUS_TONE_READY,
-	STATUS_TONE_LIVE,
-	STATUS_TONE_ERROR,
-};
-
-/* Implemented in ios-camera-source.c */
-void ios_camera_enqueue_control(struct ios_camera_source *s, const char *json,
-				size_t len);
-void ios_camera_copy_status(struct ios_camera_source *s, char *buf,
-			    size_t size, enum ios_camera_status_tone *tone);
-void ios_camera_copy_state(struct ios_camera_source *s, char *buf,
-			   size_t size);
-void ios_camera_copy_name(struct ios_camera_source *s, char *buf, size_t size);
-bool ios_camera_is_screen(struct ios_camera_source *s);
-bool ios_camera_is_standby(struct ios_camera_source *s);
-bool ios_camera_is_connected(struct ios_camera_source *s);
-bool ios_camera_auto_start(struct ios_camera_source *s);
-/* Lip-sync calibration stage: "off", "measuring", "locked" or "relocking"
- * (docs/UI_DESIGN.md). Returns a static string — no ownership. */
-const char *ios_camera_sync_state(struct ios_camera_source *s);
-/* Requests a fresh lip-sync calibration (drops the locked mic figure).
- * Safe from any thread; the dial loop performs the reset. */
-void ios_camera_recalibrate(struct ios_camera_source *s);
-void ios_camera_set_auto_start(struct ios_camera_source *s, bool on);
-
-/* One server, many sources. Camera sources register at create and
- * unregister at destroy (before freeing anything the upcalls above
- * touch); the server runs while at least one source is registered and
- * the plugin-wide setting is on. Requests address a source with the
- * ?src= id listed by /api/sources; no id means the first source, so
- * single-source setups and older scripts work unchanged.
- * apply_settings reconciles the server with the plugin-wide enable/port
- * settings. All three calls: main/UI thread only. */
-void web_control_register(struct ios_camera_source *source);
-void web_control_unregister(struct ios_camera_source *source);
+/* Reconciles the server with the plugin-wide enable/port settings and
+ * the registry: it runs while the setting is on and at least one camera
+ * source exists. Call after a camera source is added or removed and after
+ * the plugin-wide settings change. Not from a request handler. */
 void web_control_apply_settings(void);
 void web_control_shutdown(void);

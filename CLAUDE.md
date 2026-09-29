@@ -56,8 +56,11 @@ Read the matching doc before touching an area:
 
 ## Commands
 
-There is no test suite; verification is compile checks + CI + manual device
-testing. The `.claude/skills/verify` skill has per-surface verification
+Verification is mostly compile checks + CI + manual device testing. The
+plugin's pure logic (the STATE parser, its JSON reader, source-registry
+lifetime) has standalone unit tests, opt-in and not run by CI:
+`cmake -B build -DLENSLINK_BUILD_TESTS=ON … && cmake --build build && ctest
+--test-dir build` (`obs-plugin/tests/`). The `.claude/skills/verify` skill has per-surface verification
 recipes for this container (including how to test the App Store Connect
 scripts against a local mock).
 
@@ -197,15 +200,26 @@ and idle, waiting for remote start". Points that shape the code:
 - Transports: plain LAN dial, `usbmux.c` (usbmuxd client for USB),
   `mdns.c` (one-shot Bonjour browse of `_lenslink._tcp` for the Phone
   dropdown).
+- `source-registry.c` is the one registry of live LensLink sources and
+  the one API every surface uses to read and operate them: runtime ids
+  (never reused), snapshots, typed camera STATE, queued commands, safe
+  `obs_source_t` refs. `ios-camera-source.c` implements its provider
+  upcalls; consumers never hold a source pointer. STATE is parsed once, on
+  arrival, by `camera-state.c` (via the bounded `json-reader.c` — libobs's
+  `obs_data` JSON import drops arrays of strings/numbers); the raw JSON is
+  still cached for `/api/state`.
 - `web-control.c` serves the browser control panel on `localhost:9980`
-  plus `/api/state` and `/api/control`.
+  plus `/api/state` and `/api/control`, addressing sources through the
+  registry.
 - `plugin-settings.c` holds plugin-wide settings (Tools → LensLink
   Settings); global settings are never duplicated in per-source properties.
 - `frontend-ui.cpp` (Qt, optional — guarded by `LENSLINK_FRONTEND`) draws
   the status-bar readout and the LensLink dock. It resolves the five
   obs-frontend-api symbols at runtime rather than linking a frontend
-  library, and reads state only through the `health.h` snapshot API — keep
-  that boundary; nothing else may reach across it.
+  library, and reads and controls sources only through
+  `source-registry.h` — keep that boundary; nothing else may reach across
+  it (the web panel and diagnostics are peers on the same API, and the
+  dock must never call the web panel's HTTP endpoints).
 - `net-compat.h` is the Winsock/BSD-socket shim; use it instead of
   platform `#ifdef`s in new code.
 - Locale strings: `obs-plugin/data/locale/<locale>.ini`, `en-US.ini` is

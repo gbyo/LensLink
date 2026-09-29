@@ -71,6 +71,8 @@ add_library(${PROJECT_NAME} MODULE
   src/device-identity.c
   src/handshake.c
   src/mdns-parse.c
+  src/scene-walk.c
+  src/scene-walk-obs.c
   src/protocol.h
   src/web-control.h
   src/lipsync.h
@@ -85,6 +87,9 @@ add_library(${PROJECT_NAME} MODULE
   src/source-registry.h
   src/camera-state.h
   src/json-reader.h
+  src/lenslink-uuid.h
+  src/scene-walk.h
+  src/scene-walk-obs.h
 )
 
 target_link_libraries(${PROJECT_NAME} PRIVATE OBS::libobs ${FFMPEG_TARGET})

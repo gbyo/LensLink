@@ -72,3 +72,9 @@ endfunction()
 lenslink_fuzz(json ${_src}/handshake.c ${_src}/camera-state.c
               ${_src}/json-reader.c ${_src}/device-identity.c)
 lenslink_fuzz(mdns ${_src}/mdns-parse.c ${_src}/device-identity.c)
+
+# The dock's logic, split from its widgets so it needs neither Qt nor
+# libobs: the scene walk behind the Preview tally.
+add_executable(test-scene-walk test-scene-walk.c ${_src}/scene-walk.c)
+target_include_directories(test-scene-walk PRIVATE ${_src})
+add_test(NAME scene-walk COMMAND test-scene-walk)

@@ -39,6 +39,7 @@
 
 #include "camera-state.h"
 #include "device-identity.h"
+#include "lenslink-uuid.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -64,6 +65,10 @@ struct lenslink_source_info {
 	uint32_t id;            /* runtime id; never 0 for a real source */
 	char source_name[128];  /* the OBS source's (user-editable) name —
 				 * the production role, e.g. "Stage Left" */
+	char uuid[LENSLINK_UUID_SIZE]; /* the OBS source's persistent UUID:
+				 * the key for anything saved or selected
+				 * across renames and restarts (the runtime
+				 * id above is neither) */
 	char device_name[64];   /* connected phone's display name (HELLO);
 				 * "" if unknown. Changes when the phone is
 				 * renamed — display only, never identity. */
@@ -97,10 +102,13 @@ struct lenslink_source_info {
 				 * "locked"/"relocking" (static string) */
 
 	/* OBS tally, exactly as sent to the phone. `program`: part of what
-	 * OBS outputs. `preview`: shown somewhere (studio preview, a
-	 * projector, a rendered-but-hidden scene) but not on program — a
-	 * source-level approximation; a true "in the Preview scene" tally
-	 * needs the frontend's scene knowledge. */
+	 * OBS outputs — libobs's own source-active state, so it is true
+	 * through nested scenes and for both sides of a running transition.
+	 * `preview`: shown somewhere (studio preview, a projector, a
+	 * rendered-but-hidden scene) but not on program — a source-level
+	 * approximation that is NOT OBS Preview; only the phone's own tally
+	 * still uses it. The dock ignores it: true Preview needs the
+	 * frontend's scene knowledge (scene-walk.h). */
 	bool program;
 	bool preview;
 

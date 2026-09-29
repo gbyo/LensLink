@@ -1419,6 +1419,8 @@ void ios_camera_fill_info(struct ios_camera_source *s,
 	const char *name = obs_source_get_name(s->source);
 	snprintf(h->source_name, sizeof(h->source_name), "%s",
 		 name ? name : "");
+	const char *uuid = obs_source_get_uuid(s->source);
+	snprintf(h->uuid, sizeof(h->uuid), "%s", uuid ? uuid : "");
 
 	pthread_mutex_lock(&s->status_mutex);
 	copy_utf8(h->status, sizeof(h->status), s->status.array);

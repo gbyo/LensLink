@@ -28,6 +28,22 @@ static const struct fuzz_seed seeds[] = {
 		  "\\ude00\"}],\"iso\":1e3,\"future\":{\"a\":[1,{\"b\":null}]}}"),
 	FUZZ_SEED("[[[[{\"a\":\"\\\"\\u0000\"}]]]]"),
 	FUZZ_SEED("{\"minISO\":34,\"maxISO\":3072,\"color\":\"log\"}"),
+	/* Phone telemetry: a normal one, a pressured one with every factor
+	 * (and a future one), and impossible/mistyped values. */
+	FUZZ_SEED("{\"batteryPercent\":87,\"batteryState\":\"charging\","
+		  "\"lowPowerMode\":false,\"thermalState\":\"nominal\","
+		  "\"systemPressure\":\"nominal\"}"),
+	FUZZ_SEED("{\"batteryPercent\":19,\"batteryState\":\"unplugged\","
+		  "\"lowPowerMode\":true,\"thermalState\":\"critical\","
+		  "\"systemPressure\":\"shutdown\",\"systemPressureFactors\":"
+		  "[\"systemTemperature\",\"cameraTemperature\","
+		  "\"depthModuleTemperature\",\"peakPower\","
+		  "\"batteryStress\",\"future\"]}"),
+	FUZZ_SEED("{\"batteryPercent\":140.5,\"batteryPercent\":\"9\","
+		  "\"batteryState\":7,\"lowPowerMode\":null,"
+		  "\"thermalState\":\"lava\",\"systemPressure\":\"serious\","
+		  "\"systemPressureFactors\":[1,null,[\"peakPower\"],"
+		  "\"peakPower\",\"\\u0000\"]}"),
 };
 
 const struct fuzz_seed *fuzz_seeds(size_t *count)
@@ -77,7 +93,9 @@ static void check_state(const uint8_t *data, size_t size)
 	bool ok = lenslink_camera_state_parse((const char *)data, size, &st);
 	FUZZ_ASSERT(ok == st.valid);
 	if (!ok) {
+		const struct lenslink_telemetry none = {0};
 		FUZZ_ASSERT(st.has == 0 && st.lens_count == 0);
+		FUZZ_ASSERT(memcmp(&st.telemetry, &none, sizeof(none)) == 0);
 		return;
 	}
 	FUZZ_ASSERT(st.lens_count <= LLCS_MAX_LENSES);
@@ -92,6 +110,29 @@ static void check_state(const uint8_t *data, size_t size)
 					       sizeof(st.mics[i].name)));
 	}
 	FUZZ_ASSERT(fuzz_utf8_field_ok(st.lens, sizeof(st.lens)));
+
+	/* Telemetry is always a valid fact or plainly unknown. */
+	const struct lenslink_telemetry *t = &st.telemetry;
+	FUZZ_ASSERT(t->has_battery_percent
+			    ? t->battery_percent >= 0 && t->battery_percent <= 100
+			    : t->battery_percent == 0);
+	FUZZ_ASSERT(t->has_low_power_mode || !t->low_power_mode);
+	FUZZ_ASSERT((int)t->battery_state >= LL_BATTERY_UNKNOWN &&
+		    (int)t->battery_state <= LL_BATTERY_FULL);
+	FUZZ_ASSERT((int)t->thermal_state >= LL_THERMAL_UNKNOWN &&
+		    (int)t->thermal_state <= LL_THERMAL_CRITICAL);
+	FUZZ_ASSERT((int)t->system_pressure >= LL_PRESSURE_UNKNOWN &&
+		    (int)t->system_pressure <= LL_PRESSURE_SHUTDOWN);
+	FUZZ_ASSERT((t->system_pressure_factors &
+		     ~(LL_PRESSURE_FACTOR_BATTERY_STRESS * 2u - 1u)) == 0);
+	FUZZ_ASSERT(t->system_pressure != LL_PRESSURE_UNKNOWN ||
+		    t->system_pressure_factors == 0);
+	/* The derived views never fail on whatever came out. */
+	char line[192];
+	lenslink_telemetry_format(t, line, sizeof(line));
+	FUZZ_ASSERT(memchr(line, 0, sizeof(line)) != NULL);
+	(void)lenslink_telemetry_severity(t);
+	(void)lenslink_telemetry_pressure_cause(t);
 }
 
 /* A raw walk that reads every string into a small buffer. */

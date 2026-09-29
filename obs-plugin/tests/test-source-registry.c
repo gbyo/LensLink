@@ -25,6 +25,9 @@ struct ios_camera_source {
 	pthread_mutex_t lock;
 	char device_id[LENSLINK_DEVICE_ID_SIZE];
 	atomic_int binds;
+	/* Phone telemetry, under `lock` — a STATE arriving on the dial
+	 * loop while a dock row is being read. */
+	struct lenslink_telemetry telemetry;
 };
 
 static atomic_int g_dead_touches;
@@ -53,6 +56,7 @@ void ios_camera_fill_info(struct ios_camera_source *s,
 	snprintf(out->device_id, sizeof(out->device_id), "%s", s->device_id);
 	out->identity = s->device_id[0] ? LENSLINK_IDENTITY_SEARCHING
 					: LENSLINK_IDENTITY_UNBOUND;
+	out->telemetry = s->telemetry;
 	pthread_mutex_unlock(&s->lock);
 }
 
@@ -62,6 +66,9 @@ void ios_camera_copy_camera_state(struct ios_camera_source *s,
 	touch(s);
 	memset(out, 0, sizeof(*out));
 	out->valid = true;
+	pthread_mutex_lock(&s->lock);
+	out->telemetry = s->telemetry;
+	pthread_mutex_unlock(&s->lock);
 }
 
 void ios_camera_copy_state(struct ios_camera_source *s, char *buf,
@@ -110,12 +117,48 @@ void ios_camera_bind_device(struct ios_camera_source *s,
 
 /* --------------------------------------------------------------------- */
 
+/* One STATE's worth of telemetry, built so a torn read is detectable:
+ * every field is a function of `n`. */
+static struct lenslink_telemetry telemetry_for(unsigned n)
+{
+	struct lenslink_telemetry t = {0};
+	t.has_battery_percent = true;
+	t.battery_percent = (int)(n % 101);
+	t.battery_state = (enum lenslink_battery_state)(1 + n % 3);
+	t.has_low_power_mode = true;
+	t.low_power_mode = n & 1;
+	t.thermal_state = (enum lenslink_thermal_state)(1 + n % 4);
+	t.system_pressure = (enum lenslink_system_pressure)(1 + n % 5);
+	t.system_pressure_factors = n % 32;
+	return t;
+}
+
+static bool telemetry_consistent(const struct lenslink_telemetry *t)
+{
+	if (!t->has_battery_percent)
+		return t->system_pressure == LL_PRESSURE_UNKNOWN &&
+		       !t->battery_percent;
+	/* The test only writes n in [0, 100], so the percentage names n. */
+	struct lenslink_telemetry want =
+		telemetry_for((unsigned)t->battery_percent);
+	return memcmp(&want, t, sizeof(want)) == 0;
+}
+
+static void set_telemetry(struct ios_camera_source *s,
+			  const struct lenslink_telemetry *t)
+{
+	pthread_mutex_lock(&s->lock);
+	s->telemetry = *t;
+	pthread_mutex_unlock(&s->lock);
+}
+
 static struct ios_camera_source *make(const char *name, bool screen)
 {
 	struct ios_camera_source *s = calloc(1, sizeof(*s));
 	snprintf(s->name, sizeof(s->name), "%s", name);
 	s->screen = screen;
 	pthread_mutex_init(&s->lock, NULL);
+	s->telemetry = telemetry_for(0);
 	return s;
 }
 
@@ -247,6 +290,41 @@ static void test_bind(void)
 	free(a);
 }
 
+/* A source's telemetry reaches every read path whole, and per source. */
+static void test_telemetry_passthrough(void)
+{
+	struct ios_camera_source *a = make("Stage Left", false);
+	struct ios_camera_source *b = make("Crowd", false);
+	uint32_t ia = lenslink_registry_add(a);
+	uint32_t ib = lenslink_registry_add(b);
+	struct lenslink_telemetry ta = telemetry_for(87);
+	struct lenslink_telemetry tb = {0}; /* a phone that sends none */
+	set_telemetry(a, &ta);
+	set_telemetry(b, &tb);
+
+	struct lenslink_source_info info;
+	CHECK(lenslink_source_get_info(ia, &info));
+	CHECK(memcmp(&info.telemetry, &ta, sizeof(ta)) == 0);
+	CHECK(lenslink_source_get_info(ib, &info));
+	CHECK(memcmp(&info.telemetry, &tb, sizeof(tb)) == 0);
+
+	struct lenslink_source_info list[LENSLINK_MAX_SOURCES];
+	size_t n = lenslink_source_enum(list, LENSLINK_MAX_SOURCES);
+	CHECK(n == 2);
+	CHECK(memcmp(&list[0].telemetry, &ta, sizeof(ta)) == 0);
+	CHECK(memcmp(&list[1].telemetry, &tb, sizeof(tb)) == 0);
+
+	struct lenslink_camera_state st;
+	CHECK(lenslink_source_get_camera_state(ia, &st));
+	CHECK(memcmp(&st.telemetry, &ta, sizeof(ta)) == 0);
+	CHECK(!list[1].telemetry.has_battery_percent);
+
+	destroy(a);
+	destroy(b);
+	free(a);
+	free(b);
+}
+
 static void test_command_json(void)
 {
 	CHECK_STR(lenslink_stream_command_json(LENSLINK_STREAM_START),
@@ -298,7 +376,9 @@ static void *reader_thread(void *arg)
 			uint32_t id = list[i].id;
 			/* The id may die between enum and these calls: they
 			 * must fail cleanly, never touch the corpse. */
-			lenslink_source_get_camera_state(id, &st);
+			if (lenslink_source_get_camera_state(id, &st) &&
+			    !telemetry_consistent(&st.telemetry))
+				atomic_fetch_add(&g_torn, 1);
 			lenslink_source_copy_state_json(id, json,
 							sizeof(json));
 			lenslink_source_stream_command(id,
@@ -310,6 +390,8 @@ static void *reader_thread(void *arg)
 			lenslink_source_bind_device(id, (id & 1) ? ID_A : "");
 			struct lenslink_source_info info;
 			if (lenslink_source_get_info(id, &info)) {
+				if (!telemetry_consistent(&info.telemetry))
+					atomic_fetch_add(&g_torn, 1);
 				bool bound = info.device_id[0] != 0;
 				if (bound && !lenslink_device_id_valid(
 						     info.device_id))
@@ -325,10 +407,28 @@ static void *reader_thread(void *arg)
 	return NULL;
 }
 
+/* The dial loop's side of a STATE: rewrites a live source's telemetry
+ * (each write internally consistent) while the readers above look. */
+static struct ios_camera_source *g_writer_target;
+
+static void *telemetry_writer_thread(void *arg)
+{
+	(void)arg;
+	for (unsigned n = 0; !atomic_load(&g_stop); n++) {
+		struct lenslink_telemetry t = telemetry_for(n % 101);
+		set_telemetry(g_writer_target, &t);
+	}
+	return NULL;
+}
+
 static void test_concurrent_churn(void)
 {
-	pthread_t readers[4];
+	pthread_t readers[4], writer;
 	atomic_store(&g_stop, false);
+	struct ios_camera_source *steady = make("steady", false);
+	lenslink_registry_add(steady);
+	g_writer_target = steady;
+	pthread_create(&writer, NULL, telemetry_writer_thread, NULL);
 	for (int i = 0; i < 4; i++)
 		pthread_create(&readers[i], NULL, reader_thread, NULL);
 
@@ -352,6 +452,9 @@ static void test_concurrent_churn(void)
 	atomic_store(&g_stop, true);
 	for (int i = 0; i < 4; i++)
 		pthread_join(readers[i], NULL);
+	pthread_join(writer, NULL);
+	destroy(steady);
+	free(steady);
 	for (int round = 0; round < CHURN_ROUNDS; round++)
 		free(graveyard[round]);
 	free(graveyard);
@@ -365,6 +468,7 @@ int main(void)
 {
 	test_basics();
 	test_bind();
+	test_telemetry_passthrough();
 	test_command_json();
 	test_capacity();
 	test_concurrent_churn();

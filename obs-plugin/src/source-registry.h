@@ -90,7 +90,8 @@ struct lenslink_source_info {
 	bool connected;         /* a device connection is live */
 	bool standby;           /* connected, camera idle (remote start) */
 	bool paused;            /* connected, video held (STATE paused) */
-	bool has_state;         /* a camera STATE arrived this connection */
+	bool has_state;         /* a STATE arrived this connection (in
+				 * standby it carries telemetry only) */
 	bool auto_start;        /* the source's auto-start property */
 	const char *sync;       /* lip-sync stage: "off"/"measuring"/
 				 * "locked"/"relocking" (static string) */
@@ -119,6 +120,14 @@ struct lenslink_source_info {
 	int hw_retries;         /* hardware decode fell back this often */
 	char decoder[32];       /* "VideoToolbox", "D3D11VA", "software", … */
 	int latency_ms;         /* avg capture→decode; 0 until measured */
+
+	/* The phone's power and capture health from its latest STATE — the
+	 * facts only (camera-state.h has the classification helpers and the
+	 * warning that system pressure is not thermal state). All unknown
+	 * until a STATE with telemetry arrives on this connection; cleared
+	 * with the connection. Carried here, beside the row's other
+	 * fields, so a list or dock needs no second fetch and no JSON. */
+	struct lenslink_telemetry telemetry;
 
 	/* Rates derived by the dial loop from successive 1 Hz mirrors, so
 	 * every surface shows the same numbers. Valid only when has_rates

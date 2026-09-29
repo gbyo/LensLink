@@ -1427,6 +1427,7 @@ void ios_camera_fill_info(struct ios_camera_source *s,
 	h->standby = s->standby;
 	h->stream_is_screen = s->is_screen;
 	h->has_state = s->cam_state.valid;
+	h->telemetry = s->cam_state.telemetry;
 	h->frames = s->stat_frames;
 	h->bytes = s->stat_bytes;
 	h->video_packets = s->stat_packets;

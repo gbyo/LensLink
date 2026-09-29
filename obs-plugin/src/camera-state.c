@@ -2,6 +2,7 @@
 #include "json-reader.h"
 
 #include <math.h>
+#include <stdio.h>
 #include <string.h>
 
 /* Generous physical bounds: they exist to keep a hostile or corrupted
@@ -211,12 +212,166 @@ static const struct enum_name pause_names[] = {
 
 #define COUNT(a) (sizeof(a) / sizeof((a)[0]))
 
+/* --- Telemetry ------------------------------------------------------------
+ *
+ * Unlike the camera-control fields above, a bad telemetry value must leave
+ * its field *unknown* — even when an earlier duplicate key already set it —
+ * so each reader resets its field first (the last key wins, whatever its
+ * type) and sets it only from a value that is valid as sent. Nothing is
+ * clamped: an impossible battery percentage is not a possible one. */
+
+static const struct enum_name battery_state_names[] = {
+	{"unplugged", LL_BATTERY_UNPLUGGED},
+	{"charging", LL_BATTERY_CHARGING},
+	{"full", LL_BATTERY_FULL},
+};
+static const struct enum_name thermal_state_names[] = {
+	{"nominal", LL_THERMAL_NOMINAL},
+	{"fair", LL_THERMAL_FAIR},
+	{"serious", LL_THERMAL_SERIOUS},
+	{"critical", LL_THERMAL_CRITICAL},
+};
+static const struct enum_name system_pressure_names[] = {
+	{"nominal", LL_PRESSURE_NOMINAL},
+	{"fair", LL_PRESSURE_FAIR},
+	{"serious", LL_PRESSURE_SERIOUS},
+	{"critical", LL_PRESSURE_CRITICAL},
+	{"shutdown", LL_PRESSURE_SHUTDOWN},
+};
+/* In the order the app sends (and diagnostics print) them. */
+static const struct enum_name pressure_factor_names[] = {
+	{"systemTemperature", LL_PRESSURE_FACTOR_SYSTEM_TEMPERATURE},
+	{"cameraTemperature", LL_PRESSURE_FACTOR_CAMERA_TEMPERATURE},
+	{"depthModuleTemperature", LL_PRESSURE_FACTOR_DEPTH_MODULE_TEMPERATURE},
+	{"peakPower", LL_PRESSURE_FACTOR_PEAK_POWER},
+	{"batteryStress", LL_PRESSURE_FACTOR_BATTERY_STRESS},
+};
+
+#define LL_THERMAL_FACTORS                                      \
+	(LL_PRESSURE_FACTOR_SYSTEM_TEMPERATURE |                \
+	 LL_PRESSURE_FACTOR_CAMERA_TEMPERATURE |                \
+	 LL_PRESSURE_FACTOR_DEPTH_MODULE_TEMPERATURE)
+#define LL_POWER_FACTORS \
+	(LL_PRESSURE_FACTOR_PEAK_POWER | LL_PRESSURE_FACTOR_BATTERY_STRESS)
+
+/* An integer 0..100, or unknown. */
+static bool read_battery_percent(struct json_reader *r,
+				 struct lenslink_telemetry *t)
+{
+	double v;
+	t->has_battery_percent = false;
+	t->battery_percent = 0;
+	if (json_peek(r) != JSON_TYPE_NUMBER)
+		return json_skip(r);
+	if (!json_read_number(r, &v))
+		return false;
+	if (isfinite(v) && v >= 0.0 && v <= 100.0 && v == floor(v)) {
+		t->battery_percent = (int)v;
+		t->has_battery_percent = true;
+	}
+	return true;
+}
+
+static bool read_low_power_mode(struct json_reader *r,
+				struct lenslink_telemetry *t)
+{
+	t->has_low_power_mode = false;
+	t->low_power_mode = false;
+	if (json_peek(r) != JSON_TYPE_BOOL)
+		return json_skip(r);
+	if (!json_read_bool(r, &t->low_power_mode))
+		return false;
+	t->has_low_power_mode = true;
+	return true;
+}
+
+/* A string enum whose every failure — wrong type, unknown or oversized
+ * name — is 0, the UNKNOWN value each telemetry enum starts with. */
+static bool read_telemetry_enum(struct json_reader *r, int *field,
+				const struct enum_name *names, size_t count)
+{
+	int e = 0;
+	bool ok = read_enum(r, &e, names, count, 0);
+	*field = e;
+	return ok;
+}
+
+/* "systemPressureFactors": ["cameraTemperature", ...] into a bitmask.
+ * Unknown names, non-strings and repeats are ignored (a factor a future
+ * app adds must not cost the ones we know); the array's length is
+ * bounded by the payload itself. */
+static bool read_pressure_factors(struct json_reader *r, uint32_t *bits)
+{
+	*bits = 0;
+	if (json_peek(r) != JSON_TYPE_ARRAY)
+		return json_skip(r);
+	if (!json_array_begin(r))
+		return false;
+	while (json_array_next(r)) {
+		char name[32];
+		bool truncated = false;
+		if (json_peek(r) != JSON_TYPE_STRING) {
+			if (!json_skip(r))
+				return false;
+			continue;
+		}
+		if (!json_read_string(r, name, sizeof(name), &truncated))
+			return false;
+		if (truncated)
+			continue;
+		for (size_t i = 0; i < COUNT(pressure_factor_names); i++) {
+			if (strcmp(name, pressure_factor_names[i].name) == 0) {
+				*bits |= (uint32_t)pressure_factor_names[i].value;
+				break;
+			}
+		}
+	}
+	return !r->error;
+}
+
+/* Returns true when `key` was a telemetry key (its value consumed, into
+ * *ok). */
+static bool read_telemetry_field(struct json_reader *r, const char *key,
+				 struct lenslink_telemetry *t, bool *ok)
+{
+	int e;
+
+#define IS(k) (strcmp(key, k) == 0)
+	if (IS("batteryPercent")) {
+		*ok = read_battery_percent(r, t);
+	} else if (IS("batteryState")) {
+		*ok = read_telemetry_enum(r, &e, battery_state_names,
+					  COUNT(battery_state_names));
+		t->battery_state = (enum lenslink_battery_state)e;
+	} else if (IS("lowPowerMode")) {
+		*ok = read_low_power_mode(r, t);
+	} else if (IS("thermalState")) {
+		*ok = read_telemetry_enum(r, &e, thermal_state_names,
+					  COUNT(thermal_state_names));
+		t->thermal_state = (enum lenslink_thermal_state)e;
+	} else if (IS("systemPressure")) {
+		*ok = read_telemetry_enum(r, &e, system_pressure_names,
+					  COUNT(system_pressure_names));
+		t->system_pressure = (enum lenslink_system_pressure)e;
+	} else if (IS("systemPressureFactors")) {
+		*ok = read_pressure_factors(r, &t->system_pressure_factors);
+	} else {
+		return false;
+	}
+#undef IS
+	return true;
+}
+
 static bool read_field(struct json_reader *r, const char *key,
 		       struct lenslink_camera_state *st, double *min_iso,
 		       double *max_iso, double *min_shutter,
 		       double *max_shutter, uint32_t *range_bits)
 {
 	int e;
+	bool telemetry_ok;
+
+	if (read_telemetry_field(r, key, &st->telemetry, &telemetry_ok))
+		return telemetry_ok;
 
 #define IS(k) (strcmp(key, k) == 0)
 	if (IS("paused"))
@@ -407,8 +562,140 @@ bool lenslink_camera_state_parse(const char *json, size_t len,
 	/* "paused": false with a leftover reason means not paused. */
 	if (!st.paused)
 		st.pause_reason = LL_PAUSE_NONE;
+	/* Factors explain a pressure level; with no level to explain they are
+	 * a fragment of something malformed, not a fact. */
+	if (st.telemetry.system_pressure == LL_PRESSURE_UNKNOWN)
+		st.telemetry.system_pressure_factors = 0;
 
 	st.valid = true;
 	*out = st;
 	return true;
+}
+
+/* --- Derived classifications and names ------------------------------------ */
+
+static bool pressure_elevated(enum lenslink_system_pressure p)
+{
+	return p == LL_PRESSURE_SERIOUS || p == LL_PRESSURE_CRITICAL ||
+	       p == LL_PRESSURE_SHUTDOWN;
+}
+
+bool lenslink_telemetry_any(const struct lenslink_telemetry *t)
+{
+	return t->has_battery_percent ||
+	       t->battery_state != LL_BATTERY_UNKNOWN ||
+	       t->has_low_power_mode || t->thermal_state != LL_THERMAL_UNKNOWN ||
+	       t->system_pressure != LL_PRESSURE_UNKNOWN;
+}
+
+enum lenslink_pressure_cause
+lenslink_telemetry_pressure_cause(const struct lenslink_telemetry *t)
+{
+	if (!pressure_elevated(t->system_pressure))
+		return LL_PRESSURE_CAUSE_NONE;
+	bool thermal = (t->system_pressure_factors & LL_THERMAL_FACTORS) != 0;
+	bool power = (t->system_pressure_factors & LL_POWER_FACTORS) != 0;
+	if (thermal && power)
+		return LL_PRESSURE_CAUSE_THERMAL_AND_POWER;
+	if (thermal)
+		return LL_PRESSURE_CAUSE_THERMAL;
+	if (power)
+		return LL_PRESSURE_CAUSE_POWER;
+	return LL_PRESSURE_CAUSE_UNSPECIFIED;
+}
+
+bool lenslink_telemetry_battery_low(const struct lenslink_telemetry *t)
+{
+	return t->has_battery_percent &&
+	       t->battery_state == LL_BATTERY_UNPLUGGED &&
+	       t->battery_percent <= LL_BATTERY_LOW_PERCENT;
+}
+
+enum lenslink_telemetry_severity
+lenslink_telemetry_severity(const struct lenslink_telemetry *t)
+{
+	if (t->thermal_state == LL_THERMAL_CRITICAL ||
+	    t->system_pressure == LL_PRESSURE_CRITICAL ||
+	    t->system_pressure == LL_PRESSURE_SHUTDOWN)
+		return LL_SEVERITY_CRITICAL;
+	if (lenslink_telemetry_battery_low(t) ||
+	    t->thermal_state == LL_THERMAL_SERIOUS ||
+	    t->system_pressure == LL_PRESSURE_SERIOUS)
+		return LL_SEVERITY_WARNING;
+	if (t->has_low_power_mode && t->low_power_mode)
+		return LL_SEVERITY_INFO;
+	return LL_SEVERITY_NORMAL;
+}
+
+static const char *name_of(const struct enum_name *names, size_t count,
+			   int value)
+{
+	for (size_t i = 0; i < count; i++)
+		if (names[i].value == value)
+			return names[i].name;
+	return "unknown";
+}
+
+const char *lenslink_battery_state_name(enum lenslink_battery_state s)
+{
+	return name_of(battery_state_names, COUNT(battery_state_names), s);
+}
+
+const char *lenslink_thermal_state_name(enum lenslink_thermal_state s)
+{
+	return name_of(thermal_state_names, COUNT(thermal_state_names), s);
+}
+
+const char *lenslink_system_pressure_name(enum lenslink_system_pressure s)
+{
+	return name_of(system_pressure_names, COUNT(system_pressure_names), s);
+}
+
+const char *lenslink_pressure_cause_name(enum lenslink_pressure_cause c)
+{
+	switch (c) {
+	case LL_PRESSURE_CAUSE_UNSPECIFIED:
+		return "unspecified";
+	case LL_PRESSURE_CAUSE_THERMAL:
+		return "thermal";
+	case LL_PRESSURE_CAUSE_POWER:
+		return "power";
+	case LL_PRESSURE_CAUSE_THERMAL_AND_POWER:
+		return "thermal+power";
+	case LL_PRESSURE_CAUSE_NONE:
+		break;
+	}
+	return "none";
+}
+
+void lenslink_telemetry_format(const struct lenslink_telemetry *t, char *buf,
+			       size_t size)
+{
+	char percent[8] = "?";
+	char lpm[2] = "?";
+	if (!size)
+		return;
+	if (t->has_battery_percent)
+		snprintf(percent, sizeof(percent), "%d", t->battery_percent);
+	if (t->has_low_power_mode)
+		lpm[0] = t->low_power_mode ? '1' : '0';
+	int n = snprintf(buf, size,
+			 "battery=%s %s lpm=%s thermal=%s pressure=%s", percent,
+			 lenslink_battery_state_name(t->battery_state), lpm,
+			 lenslink_thermal_state_name(t->thermal_state),
+			 lenslink_system_pressure_name(t->system_pressure));
+	if (n < 0 || (size_t)n >= size)
+		return;
+	const char *sep = " factors=";
+	for (size_t i = 0; i < COUNT(pressure_factor_names); i++) {
+		if (!(t->system_pressure_factors &
+		      (uint32_t)pressure_factor_names[i].value))
+			continue;
+		int w = snprintf(buf + n, size - (size_t)n, "%s%s", sep,
+				 pressure_factor_names[i].name);
+		if (w < 0 || (size_t)w >= size - (size_t)n)
+			return;
+		n += w;
+		sep = ",";
+	}
 }

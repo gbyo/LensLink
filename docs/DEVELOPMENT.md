@@ -34,6 +34,12 @@ obs-plugin/            C plugin for OBS Studio (CMake)
   src/web-control.c    browser control panel (http://localhost:9980)
   src/diagnostics.c    the pasteable diagnostics report (Tools menu, /api/diagnostics)
   src/lipsync.c        audio cross-correlation for lip-sync calibration
+  src/frontend-ui.cpp  OBS status bar + dock wiring (Qt, optional)
+  src/rig-dock.cpp     the dock's camera-card widgets (Qt, optional)
+  src/rig-model.c      registry snapshot → cards/summary: tally, warnings, text (pure)
+  src/rig-order.c      the operator's camera order, keyed by OBS source UUID (pure)
+  src/scene-walk.c     "which LensLink sources are visible through this scene" (pure)
+  src/scene-walk-obs.c   its thin libobs adapter
   tests/               opt-in unit tests for pure logic (-DLENSLINK_BUILD_TESTS=ON)
   tests/fuzz/          fuzz harnesses for the untrusted-input parsers (run by ctest)
   data/locale/         en-US.ini (source) + one .ini per language
@@ -127,6 +133,58 @@ camera's pressure observation    ─┘   (StreamTelemetry)
   registry (including under ASan/UBSan/TSan); `ios-app/Tests/run-telemetry-tests.sh`
   (macOS, Xcode, opt-in) runs the platform-enum mapping tests in the
   iOS Simulator.
+
+## The OBS dock
+
+The dock is a camera-status strip (design: `UI_DESIGN.md` §6.4), built
+in three layers so only the last needs Qt:
+
+```
+registry snapshot ──► rig-model.c ──► rig-dock.cpp (widgets)
+scene-walk.c  ──(Preview set)──┘         ▲
+rig-order.c   ──(slots)────────┘   frontend-ui.cpp: events, signals, timer,
+                                   persistence, actions
+```
+
+- **Program / Preview / selected are three inputs, three outputs.**
+  PGM is `lenslink_source_info.program`, libobs's source-active state via
+  the source's own activate/deactivate callbacks. PVW is membership of
+  the set `lenslink_preview_collect()` returns for the Studio Mode Preview
+  scene; the registry's older `preview` flag ("showing but not program",
+  which a projector satisfies) is ignored by the dock — it still drives
+  the *phone's* tally. Selection is `lenslink_rig.selected`, a UUID.
+- **Scene walk** (`scene-walk.c`) is written over an abstract graph so
+  cycles, hidden groups, nested scenes, duplicate references and bounds
+  are unit-tested without libobs; an unknowable graph yields no PVW, never
+  a false one. It returns UUID strings, so no OBS pointer outlives a
+  refresh. The frontend queries the Preview scene afresh each refresh
+  (with a strong reference, released at once) and queries nothing between
+  `SCENE_COLLECTION_CHANGING` and `..._CHANGED`.
+- **Update path.** Everything runs on the UI thread. libobs signals
+  (`source_activate`, `source_deactivate`, `source_create`,
+  `source_destroy`, `source_rename`, filtered to LensLink sources) can
+  fire on the graphics thread, so they only post one coalesced queued
+  refresh; frontend events (scene, preview scene, Studio Mode,
+  transition, scene list, collection, theme) do the same. The existing
+  1 s timer carries the numbers and re-derives Preview. There is no other
+  timer and nothing per frame. Cards are updated in place, keyed by OBS
+  source UUID.
+- **Persistence.** The camera order is saved with the scene collection
+  through `obs_frontend_add_save_callback`, under
+  `modules.lenslink = {"version": 1, "dock": {"order": [{"uuid": …}, …]}}`.
+  Only cameras that exist at save time are written. A scene-collection
+  switch resets order, selection and Preview before the old sources go,
+  and the new collection's callback restores its own order. Runtime ids
+  are never persisted; they only address commands.
+- **Optional frontend symbols.** Studio Mode, preview scene, save
+  callbacks and source properties are resolved at runtime like the rest;
+  without one the feature degrades (no PVW, no persistence, no menu
+  entry) and the module still loads.
+- **Tests.** `test-scene-walk`, `test-rig-order`, `test-rig-model` (against
+  the real `en-US.ini`) run with the rest. The widgets and event wiring
+  have no unit tests: they are exercised by hand in a real OBS, with
+  Studio Mode, projectors, nested scenes, groups, transitions, renames,
+  and collection switches.
 
 ## Continuous integration
 

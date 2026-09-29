@@ -223,13 +223,19 @@ and idle, waiting for remote start". Points that shape the code:
   registry.
 - `plugin-settings.c` holds plugin-wide settings (Tools → LensLink
   Settings); global settings are never duplicated in per-source properties.
-- `frontend-ui.cpp` (Qt, optional — guarded by `LENSLINK_FRONTEND`) draws
-  the status-bar readout and the LensLink dock. It resolves the five
-  obs-frontend-api symbols at runtime rather than linking a frontend
-  library, and reads and controls sources only through
-  `source-registry.h` — keep that boundary; nothing else may reach across
-  it (the web panel and diagnostics are peers on the same API, and the
-  dock must never call the web panel's HTTP endpoints).
+- `frontend-ui.cpp` + `rig-dock.cpp` (Qt, optional — guarded by
+  `LENSLINK_FRONTEND`) draw the status-bar readout and the LensLink dock (a
+  strip of camera cards). They resolve their obs-frontend-api symbols at
+  runtime rather than linking a frontend library, and read and control
+  sources only through `source-registry.h` — keep that boundary; nothing
+  else may reach across it (the web panel and diagnostics are peers on the
+  same API, and the dock must never call the web panel's HTTP endpoints).
+  What the dock shows is decided by pure, unit-tested C: `rig-model.c`
+  (cards, tally, warnings, text), `rig-order.c` (operator order by OBS
+  source UUID, saved in the scene collection) and `scene-walk.c` (true
+  Preview: visibility through the Studio Mode Preview scene, never
+  `obs_source_showing`). Program, Preview and the dock's control selection
+  are three independent facts; see `docs/UI_DESIGN.md` §6.4.
 - `net-compat.h` is the Winsock/BSD-socket shim; use it instead of
   platform `#ifdef`s in new code.
 - Locale strings: `obs-plugin/data/locale/<locale>.ini`, `en-US.ini` is

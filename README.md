@@ -150,9 +150,14 @@ Slide Over and Stage Manager.
   at delay values. (See "Lip sync" below.)
 - **Stream health at a glance.** A live readout in OBS's own status bar —
   `LensLink: iPhone 60 fps · 11.9 Mb/s · 43 ms` beside OBS's stats — plus
-  a dockable **LensLink** panel (View → Docks) with one row per phone.
-  Decoded fps, wire bitrate, and measured capture→decode latency, updated
-  every second. On the phone, Stats in the Live screen's status menu
+  a dockable **LensLink** panel (View → Docks): a compact strip with one
+  numbered card per camera showing decoded fps, wire bitrate, measured
+  capture→decode latency and the phone's battery, updated every second,
+  and an amber line only when something needs you (thermal or power
+  pressure, low battery, a lost connection). **PGM** and **PVW** badges
+  show what is on Program and in Studio Mode's Preview, kept apart from
+  the card you've selected for LensLink control; cameras keep their slots
+  in the order you leave them, saved with the scene collection. On the phone, Stats in the Live screen's status menu
   shows the same health line (fps · Mb/s · dropped frames).
 - **GPU decode pipeline (beta).** Optionally keep decoded video on the
   graphics card the whole way to your scene — no round-trip through

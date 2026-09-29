@@ -113,9 +113,36 @@ description: Connect the LensLink Camera source to your iPhone over Wi-Fi or USB
   </tbody>
 </table>
 
+<h2>Reading the LensLink dock</h2>
+<p>
+  <strong>View → Docks → LensLink</strong> shows every camera at a glance:
+  a summary (<code>4 cameras · 3 live · 38.7 Mb/s</code>, then <em>All healthy</em>
+  or how many cameras need attention) above one numbered card per camera. A card
+  shows the camera's name, its frame rate, bitrate, latency and connection, and the
+  phone's battery (<code>92% ⚡</code> while charging). An amber line appears only
+  when something needs you: camera thermal or power pressure, low battery while
+  unplugged, a lost connection, or a different phone answering.
+</p>
+<ul>
+  <li><strong>PGM</strong> (red) means the camera is part of what OBS is sending out;
+    during a transition both cameras show it. <strong>PVW</strong> (green) means it is
+    visible through the Preview scene in <strong>Studio Mode</strong> — a projector or
+    a source window doesn't count, and with Studio Mode off nothing is PVW.</li>
+  <li><strong>Click a card to select it</strong> for LensLink control (a blue outline).
+    Selecting never changes OBS's Preview, Program or scenes.</li>
+  <li>Cameras keep their numbers. The order doesn't change with connection, tally or
+    warnings; new cameras go at the bottom, and the order is saved with the scene
+    collection. Right-click a card for <strong>Move up / Move down</strong>.</li>
+  <li>Right-click for <strong>Start camera</strong>, <strong>Pause / Resume</strong>,
+    <strong>Recalibrate sync</strong>, <strong>Open source properties</strong> and
+    <strong>Stop camera</strong>. Stopping or pausing a camera that is on Program asks first.</li>
+  <li><strong>LensLink Screen</strong> sources aren't cameras: they sit under a
+    <em>Screens</em> heading with their connection and health, without a number.</li>
+</ul>
+
 <h2>Keeping it healthy</h2>
 <ul>
-  <li><strong>Watch the numbers.</strong> OBS's status bar shows a line per phone — <code>LensLink: iPhone 60 fps · 11.9 Mb/s · 43 ms</code> — and <strong>View → Docks → LensLink</strong> is the same thing as a panel.</li>
+  <li><strong>Watch the numbers.</strong> OBS's status bar shows a line per phone — <code>LensLink: iPhone 60 fps · 11.9 Mb/s · 43 ms</code> — and <strong>View → Docks → LensLink</strong> is a card per camera (see below).</li>
   <li><strong>Congestion handles itself.</strong> The app briefly lowers quality and recovers rather than accumulating latency.</li>
   <li><strong>Save battery</strong> with <strong>Disconnect when this source isn't shown anywhere</strong>: the phone stops encoding whenever the source is hidden.</li>
   <li><strong>The stream is unencrypted</strong> on your network — meant for trusted home and studio networks.</li>

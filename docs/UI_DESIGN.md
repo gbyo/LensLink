@@ -547,16 +547,122 @@ identical pill, palette and control language.
 
 ### 6.4 OBS status bar & dock
 
-A third surface lives inside OBS itself (Qt, `frontend-ui.cpp`): a
-one-line health readout in the main window's status bar
-(`LensLink: <device> 60 fps · 11.9 Mb/s · 43 ms`, live sources joined by
-`  |  `, hidden when nothing is
-connected; "ready (camera idle)" during standby) and a dockable
-**LensLink** panel listing every source with its device, status, and
-rates. These render with OBS's native theme rather than our palette —
-inside OBS's chrome, OBS's design language wins; our vocabulary (the
-status wording, `fps · Mb/s · ms` ordering, monospace-style numerals)
-is what carries over.
+A third surface lives inside OBS itself (Qt: `frontend-ui.cpp` wiring,
+`rig-dock.cpp` widgets, `rig-model.c` what they show). Inside OBS's
+chrome, OBS's design language wins: native Qt widgets, painted from the
+live palette so any OBS theme (light or dark, and a theme change) just
+works — no web view, no independent colour palette. What carries over
+from our vocabulary is the status wording, the `fps · Mb/s · ms`
+ordering and tabular numerals (so a number changing doesn't make a card
+jitter).
+
+**Status bar.** One line of health,
+`LensLink: <device> 60 fps · 11.9 Mb/s · 43 ms`, live sources joined by
+`  |  `, hidden when nothing is connected ("ready (camera idle)" during
+standby). Numbers only; the dock carries the rest.
+
+**The dock is the camera-status strip, not the switcher.** OBS is the
+switcher; during a show the operator's eyes belong to Program, Preview,
+Scenes and the event. The dock is therefore quiet unless something needs
+attention, and answers at a glance: how many cameras, are they healthy,
+which are live, which is on Program, which is in Preview, which is
+selected for LensLink control, and is any developing a battery, thermal,
+pressure, latency or connection problem. It is deliberately *not* a
+control surface yet (no lens, zoom, exposure, focus, format or preview
+video) — those arrive as an inspector, not as clutter on every card.
+
+*Summary* (top): `4 cameras · 3 live · 38.7 Mb/s`, then `All healthy`
+or `1 camera needs attention`. Cameras are LensLink Camera sources only.
+Live means video is flowing — not standby, paused or disconnected. The
+bitrate sums the live cameras' current stream rate; it is throughput, not
+"Wi-Fi usage" or capacity, and never includes a disconnected camera's
+last figure. The summary never lists the warnings; the cards do.
+
+*Camera card*, top to bottom, each row only when it has something to say:
+
+1. **Number, name, tally.** The number is the camera's slot (1, 2, 3…)
+   in the operator's order; the name is the OBS *source* name — the
+   production role ("Stage Left"), never the phone's name, which is
+   secondary (tooltip). `PGM` / `PVW` badges at the right.
+2. **Health row.** `60 fps · 9.8 Mb/s · 45 ms · Wi-Fi`, with the phone's
+   battery at the right (`81%`, or `92% ⚡` on external power). Unknown
+   figures are omitted rather than shown as placeholders (`60 fps ·
+   11.2 Mb/s · USB` when latency isn't measured; nothing at all for an
+   app that reports no battery). Non-live states say so instead of
+   showing numbers: `Standby · USB`, `Paused · Wi-Fi`,
+   `Connecting… · Wi-Fi`, `Reconnecting…`. A live card doesn't say
+   "live": the numbers already prove it. A disconnected camera shows no
+   battery — a dead phone's last reading is not current.
+3. **One warning line**, only when something warrants it (below). Low
+   Power Mode alone gets a quieter, non-amber line and never sits beside
+   a real warning.
+
+**Three independent facts — never conflated, in the UI or the code:**
+
+| Fact | Meaning | Where it comes from | Look |
+|---|---|---|---|
+| **PGM** (Program) | The source is contributing to OBS's final mix | libobs's own source-active state, so it holds through nested scenes and groups, and *both* cameras are PGM while a transition between them runs | red badge + red bar |
+| **PVW** (Preview) | The source is visible through the Studio Mode Preview scene | A walk of that scene's graph: the source is an item, and the item and every group / nested-scene item above it is visible. Never "shown somewhere": a projector, a source window or the dock's own future camera preview do not cause PVW. Studio Mode off → no PVW anywhere | green badge + green bar |
+| **Selected** | The camera the operator picked for LensLink control | Dock-local state: clicking a card, Enter or Space on it | accent border (2 px), never red or green |
+
+Clicking a card changes *only* the selection — never Preview, Program,
+scenes or a transition. A camera can be PGM and PVW at once (both badges,
+both colours in the bar) and selected on top of either. Red and green
+are tally's; selection uses OBS's accent; amber is warning. Colour is
+never the only signal: the badges are text, selection is a thicker
+border *and* announced by assistive tech, and every card has an
+accessible name spelling out its number, name, on air / in preview /
+selected, health, warning and battery (charging included). The tally
+colours are semantic and identical in every theme; the card itself is
+painted from the theme.
+
+*Order.* Cameras never reorder themselves: not for connection state,
+tally, warnings, battery, latency or name. The order is the operator's,
+keyed by the OBS source's persistent UUID (never the renamable name,
+never LensLink's runtime id), stored *in the scene collection* (each
+collection has its own rig), and the number is derived from it. New
+cameras append at the bottom; a disconnected camera keeps its slot; a
+deleted one leaves the order (and is forgotten when saved), while one
+that comes back keeps its old slot. Explicit editing is a card's
+context-menu **Move up / Move down**; a dedicated setup surface may
+replace it later.
+
+*Warnings* — at most one line, the most actionable, in this order:
+wrong phone answered / phone can't confirm its identity; connection
+problem; (disconnected → `Reconnecting…` in the health row, still
+counted as needing attention); camera shut down by iOS; camera pressure
+*critical*; device heat *critical*; camera pressure *serious*; device
+running hot; low battery *while unplugged*; Low Power Mode (information
+only). Camera pressure is worded by its cause — *thermal*, *power*, both,
+or plain *system* pressure when iOS gives no reason — and is never called
+thermal without a temperature factor; the phone's own heat is a separate
+signal. Tooltips list every condition. The summary counts a camera as
+needing attention at warning or worse, never for Low Power Mode.
+
+*Screens.* LensLink Screen sources are not cameras: they are excluded
+from the count, the numbering and selection, and sit in a secondary
+**Screens** section with the same tally badges and connection/health
+text but no telemetry and no camera controls.
+
+*Context menu* (right-click or the Menu key): **Start camera** (standby),
+**Pause / Resume**, **Recalibrate sync**, **Open source properties**,
+**Move up / Move down**, and — alone at the bottom — **Stop camera**.
+Stopping or pausing a camera that is on Program first asks
+("Stop this camera? This camera is currently on air…"); nothing else
+does, and selecting never does.
+
+*Responsive direction.* The strip stays usable from a very narrow sidebar
+to a wide or floating dock: rows wrap instead of clipping, the name
+elides (full name in the tooltip) and the strip scrolls; nothing is
+hidden by width. When the inspector arrives it should take the extra
+width of a wide or floating dock rather than crowding the cards, which
+stay the same compact strip.
+
+Freshness: Program, Preview, Studio Mode, scene-collection and theme
+changes update the dock immediately (frontend events and libobs source
+signals); the numbers ride the existing one-second refresh, which also
+re-derives Preview, so a scene item hidden *inside* the Preview scene
+(which no event announces) appears within a second.
 
 ### 6.5 Plugin settings dialog (Tools → LensLink Settings)
 

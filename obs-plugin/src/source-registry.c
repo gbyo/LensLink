@@ -229,6 +229,21 @@ bool lenslink_source_set_auto_start(uint32_t id, bool on)
 	return i >= 0;
 }
 
+bool lenslink_source_bind_device(uint32_t id, const char *device_id)
+{
+	char canonical[LENSLINK_DEVICE_ID_SIZE] = "";
+	if (device_id && device_id[0] &&
+	    !lenslink_device_id_parse(device_id, strlen(device_id), canonical))
+		return false;
+
+	pthread_mutex_lock(&g_registry.mutex);
+	int i = locked_find(id);
+	if (i >= 0)
+		ios_camera_bind_device(g_registry.entries[i].src, canonical);
+	pthread_mutex_unlock(&g_registry.mutex);
+	return i >= 0;
+}
+
 bool lenslink_source_recalibrate(uint32_t id)
 {
 	pthread_mutex_lock(&g_registry.mutex);

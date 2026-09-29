@@ -61,6 +61,12 @@ static void gpu_pipeline_free(struct ios_camera_source *s);
 
 /* Bonjour service the app advertises while its listener is up. */
 #define LENSLINK_MDNS_SERVICE "_lenslink._tcp.local"
+/* How long a bound source's browse waits for its phone to answer (it
+ * returns as soon as the phone does). */
+#define IDENTITY_RESOLVE_MS 1000
+/* A bound source drops a connection whose HELLO hasn't proved the
+ * phone's identity by then. */
+#define IDENTITY_HELLO_TIMEOUT_NS (5 * 1000000000ULL)
 
 
 #define S_MODE "mode"
@@ -76,6 +82,16 @@ static void gpu_pipeline_free(struct ios_camera_source *s);
 #define S_DEACTIVATE_HIDDEN "deactivate_when_hidden"
 #define S_AUTO_START "auto_start"
 #define S_SCREEN_FPS "screen_fps"
+/* Persistent identity (device-identity.h; docs/PROTOCOL.md). Internal
+ * settings with no property widget. S_DEVICE_ID binds the source to one
+ * phone — "" (the default, and every source saved before identities
+ * existed) is an unbound source that accepts whatever answers at
+ * S_HOST, exactly as before. S_LAST_KNOWN_HOST is only an address
+ * cache for a bound source: the last address where the phone *proved*
+ * its id, written back when the scene collection is saved. S_HOST is
+ * never rewritten. */
+#define S_DEVICE_ID "device_id"
+#define S_LAST_KNOWN_HOST "last_known_host"
 
 /* Built-in OBS "Video Delay (Async)" filter. */
 #define ASYNC_DELAY_FILTER_ID "async_delay_filter"
@@ -118,6 +134,11 @@ struct ios_camera_source {
 	enum connection_mode conn_mode;
 	char host[128];
 	char usb_device[64]; /* pinned UDID for USB mode; "" = auto-assign */
+	/* The phone this source is bound to (S_DEVICE_ID, canonical), or
+	 * "" for an unbound source. Written only by update(), under
+	 * status_mutex and with the dial thread stopped — so the dial
+	 * thread reads it without a lock, everyone else under the lock. */
+	char bound_device_id[LENSLINK_DEVICE_ID_SIZE];
 	volatile bool hw_decode;
 	volatile bool diagnostics; /* verbose pipeline logging to the OBS log */
 	volatile bool dump_stream; /* write received video to a file on disk */
@@ -274,6 +295,17 @@ struct ios_camera_source {
 	 * Guarded by status_mutex; lets the web panel offer a Start button. */
 	bool standby;
 
+	/* Identity bookkeeping, guarded by status_mutex. `identity` is
+	 * UNBOUND for an unbound source; otherwise where the search for the
+	 * bound phone stands. `last_known_host` is the S_LAST_KNOWN_HOST
+	 * cache (saved by ios_camera_save), refreshed only after a HELLO
+	 * proved the id. `resolved_host` is the address last dialed, and
+	 * `peer_device_id` what the connected phone announced. */
+	enum lenslink_identity_state identity;
+	char last_known_host[128];
+	char resolved_host[128];
+	char peer_device_id[LENSLINK_DEVICE_ID_SIZE];
+
 	pthread_mutex_t status_mutex;
 	struct dstr status;
 	enum ios_camera_status_tone status_tone;
@@ -355,6 +387,41 @@ void ios_camera_set_auto_start(struct ios_camera_source *s, bool on)
 	obs_data_set_bool(settings, S_AUTO_START, on);
 	obs_source_update(s->source, settings);
 	obs_data_release(settings);
+}
+
+/* Explicit binding (registry, for a setup flow): persisted through the
+ * settings like auto-start. Binding to a different phone drops the old
+ * phone's address cache; update() sees the new id and restarts the dial
+ * loop. `device_id` is canonical or "". */
+void ios_camera_bind_device(struct ios_camera_source *s, const char *device_id)
+{
+	obs_data_t *settings = obs_source_get_settings(s->source);
+	const char *old = obs_data_get_string(settings, S_DEVICE_ID);
+	char old_id[LENSLINK_DEVICE_ID_SIZE];
+	if (!lenslink_device_id_parse(old, strlen(old), old_id) ||
+	    strcmp(old_id, device_id) != 0)
+		obs_data_set_string(settings, S_LAST_KNOWN_HOST, "");
+	obs_data_set_string(settings, S_DEVICE_ID, device_id);
+	obs_source_update(s->source, settings);
+	obs_data_release(settings);
+}
+
+/* The S_DEVICE_ID setting as the dial loop uses it: canonical, "" when
+ * unset. A value that isn't a UUID can't be matched by any phone, so it
+ * fails closed — the source stays bound and rejects everyone — rather
+ * than quietly turning into an unbound source that accepts anyone. */
+static void read_bound_device_id(obs_data_t *settings,
+				 char out[LENSLINK_DEVICE_ID_SIZE])
+{
+	const char *v = obs_data_get_string(settings, S_DEVICE_ID);
+	out[0] = 0;
+	if (!v[0] || lenslink_device_id_parse(v, strlen(v), out))
+		return;
+	blog(LOG_WARNING,
+	     "[lenslink] ignoring a malformed %s setting; this source will "
+	     "accept no phone until it is bound again",
+	     S_DEVICE_ID);
+	snprintf(out, LENSLINK_DEVICE_ID_SIZE, "%s", "INVALID");
 }
 
 static enum connection_mode parse_mode(const char *mode)
@@ -544,6 +611,17 @@ struct client_state {
 	uint64_t packets_at_decoder;
 	bool is_screen; /* screen mirror (plays system audio) vs camera */
 	bool standby;   /* app is idle, waiting for a start_stream command */
+	/* Wi-Fi address this connection dialed ("" over USB). */
+	char host[128];
+	/* A HELLO was accepted: from an unbound source's point of view any
+	 * HELLO; for a bound source, one that proved the expected id. Until
+	 * then a bound source ignores everything but the handshake and
+	 * sends the phone nothing but timesync. */
+	bool accepted;
+	uint64_t dialed_ns; /* TCP connect, for the HELLO timeout */
+	/* MISMATCH or UNIDENTIFIED when a HELLO was rejected for identity;
+	 * UNBOUND (0) means it wasn't. */
+	enum lenslink_identity_state identity_reject;
 	/* Last tally state pushed to the device. Per connection, so a
 	 * reconnect re-announces rather than assuming the phone still knows. */
 	bool tally_valid;
@@ -1357,7 +1435,13 @@ void ios_camera_fill_info(struct ios_camera_source *s,
 	h->hw_retries = s->stat_hw_retries;
 	snprintf(h->decoder, sizeof(h->decoder), "%s", s->stat_decoder);
 	h->latency_ms = (int)(s->last_video_latency_ns / 1000000);
-	snprintf(h->device, sizeof(h->device), "%s", s->stat_device);
+	copy_utf8(h->device_name, sizeof(h->device_name), s->stat_device);
+	snprintf(h->device_id, sizeof(h->device_id), "%s", s->bound_device_id);
+	snprintf(h->peer_device_id, sizeof(h->peer_device_id), "%s",
+		 s->peer_device_id);
+	snprintf(h->resolved_host, sizeof(h->resolved_host), "%s",
+		 s->resolved_host);
+	h->identity = s->identity;
 	h->has_rates = s->stat_has_rates;
 	h->fps = s->stat_fps;
 	h->bitrate_bps = s->stat_bitrate_bps;
@@ -1693,7 +1777,7 @@ static void stats_tick(struct ios_camera_source *s, struct client_state *c)
 	s->stat_hw_retries = c->hw_retry;
 	snprintf(s->stat_decoder, sizeof(s->stat_decoder), "%.31s",
 		 c->decoder ? h264_decoder_hw_name(c->decoder) : "none");
-	snprintf(s->stat_device, sizeof(s->stat_device), "%.63s", c->name);
+	copy_utf8(s->stat_device, sizeof(s->stat_device), c->name);
 	int latency_ms = (int)(s->last_video_latency_ns / 1000000);
 	pthread_mutex_unlock(&s->status_mutex);
 	lenslink_bench_latency(latency_ms);
@@ -1768,18 +1852,53 @@ static void client_disconnect(struct ios_camera_source *s,
 	s->standby = false;
 	s->stat_connected = false;
 	s->stat_device[0] = 0;
+	/* A verified phone went away: back to looking for it. A rejection
+	 * keeps its verdict — and the rejected phone's id, for the
+	 * diagnostics report — so the status can say what happened. */
+	if (c->identity_reject == LENSLINK_IDENTITY_UNBOUND)
+		s->peer_device_id[0] = 0;
+	if (s->identity == LENSLINK_IDENTITY_VERIFIED)
+		s->identity = LENSLINK_IDENTITY_SEARCHING;
 	pthread_mutex_unlock(&s->status_mutex);
 	s->stream_paused = false;
 
-	/* A kind-mismatch rejection needs its actionable status to survive
-	 * the disconnect — "Disconnected" would hide what to fix. */
+	/* A kind-mismatch or identity rejection needs its actionable status
+	 * to survive the disconnect — "Disconnected" would hide what to
+	 * fix. */
 	if (c->wrong_kind)
 		set_status(s, STATUS_TONE_ERROR, "%s",
 			   s->is_screen_source ? T_("Status.CameraOnScreen")
 					       : T_("Status.ScreenOnCamera"));
+	else if (c->identity_reject == LENSLINK_IDENTITY_MISMATCH)
+		set_status(s, STATUS_TONE_ERROR, "%s",
+			   T_("Status.WrongDevice"));
+	else if (c->identity_reject == LENSLINK_IDENTITY_UNIDENTIFIED)
+		set_status(s, STATUS_TONE_ERROR, "%s",
+			   T_("Status.UnidentifiedDevice"));
 	else
 		set_status(s, STATUS_TONE_ERROR, "%s",
 			   T_("Status.Disconnected"));
+}
+
+/* A bound source's phone proved its id at `host`: that is now the
+ * address to try first when Bonjour can't find it. Only a verified HELLO
+ * lands here — a Bonjour answer alone never moves the cache, so a
+ * malformed or spoofed advertisement can't poison it. */
+static void remember_host(struct ios_camera_source *s, const char *host)
+{
+	char old[128];
+	pthread_mutex_lock(&s->status_mutex);
+	snprintf(old, sizeof(old), "%s", s->last_known_host);
+	snprintf(s->last_known_host, sizeof(s->last_known_host), "%s", host);
+	pthread_mutex_unlock(&s->status_mutex);
+	if (strcmp(old, host) == 0)
+		return;
+	if (old[0])
+		blog(LOG_INFO, "[lenslink] '%s': phone moved from %s to %s",
+		     obs_source_get_name(s->source), old, host);
+	else
+		blog(LOG_INFO, "[lenslink] '%s': phone found at %s",
+		     obs_source_get_name(s->source), host);
 }
 
 /* Logs the H.264 stream's SPS profile/level once per decode stream — the
@@ -1813,6 +1932,13 @@ static bool handle_packet(struct ios_camera_source *s, struct client_state *c,
 			  const struct obsc_header *hdr,
 			  const uint8_t *payload)
 {
+	/* A bound source believes nothing from a phone — video, STATE,
+	 * audio, requests — before its HELLO proved which phone it is. */
+	if (s->bound_device_id[0] && !c->accepted &&
+	    hdr->type != OBSC_PKT_HELLO && hdr->type != OBSC_PKT_PING &&
+	    hdr->type != OBSC_PKT_TIMESYNC_RESP)
+		return true;
+
 	switch (hdr->type) {
 	case OBSC_PKT_HELLO: {
 		/* Parsed whole or not at all (handshake.h): a malformed HELLO
@@ -1825,6 +1951,38 @@ static bool handle_packet(struct ios_camera_source *s, struct client_state *c,
 			     "[lenslink] malformed HELLO (%u bytes); treating "
 			     "it as an unnamed camera",
 			     (unsigned)hdr->payload_size);
+		/* Identity first: nothing about the connection is believed —
+		 * no status, no name, no identify reply — until the phone has
+		 * proved it's the one a bound source expects. An unbound
+		 * source accepts every HELLO, as before identities existed. */
+		enum lenslink_identity_state verdict = lenslink_identity_verify(
+			s->bound_device_id, hello.device_id);
+		pthread_mutex_lock(&s->status_mutex);
+		snprintf(s->peer_device_id, sizeof(s->peer_device_id), "%s",
+			 hello.device_id);
+		if (verdict != LENSLINK_IDENTITY_UNBOUND)
+			s->identity = verdict;
+		pthread_mutex_unlock(&s->status_mutex);
+		if (!lenslink_identity_accepted(verdict)) {
+			c->identity_reject = verdict;
+			blog(LOG_WARNING,
+			     "[lenslink] rejecting %s%s: expected device %s, "
+			     "it announced %s",
+			     c->host[0] ? "the phone at " : "a phone over USB",
+			     c->host, s->bound_device_id,
+			     hello.device_id[0] ? hello.device_id
+			     : hello.device_id_invalid
+				     ? "a malformed id"
+				     : "none (an app older than device identity)");
+			return false;
+		}
+		if (verdict == LENSLINK_IDENTITY_VERIFIED && c->host[0])
+			remember_host(s, c->host);
+		c->accepted = true;
+		if (hello.device_id_invalid)
+			blog(LOG_WARNING, "[lenslink] HELLO carried a malformed "
+					  "deviceID; ignored");
+
 		snprintf(c->name, sizeof(c->name), "%s", hello.name);
 		c->is_screen = hello.is_screen;
 		c->standby = !c->is_screen && hello.standby;
@@ -2469,6 +2627,22 @@ static void device_release(void *owner)
 	pthread_mutex_unlock(&g_claim_mutex);
 }
 
+/* Releases one of `owner`'s claims, keeping the others. */
+static void device_release_key(const char *key, void *owner)
+{
+	if (!key[0])
+		return;
+	pthread_mutex_lock(&g_claim_mutex);
+	for (int i = 0; i < MAX_CLAIMS; i++) {
+		if (g_claims[i].owner == owner &&
+		    strcmp(g_claims[i].key, key) == 0) {
+			g_claims[i].owner = NULL;
+			g_claims[i].key[0] = 0;
+		}
+	}
+	pthread_mutex_unlock(&g_claim_mutex);
+}
+
 /*
  * Dial modes: the app on the device listens; we connect to it — over the
  * LAN (host set in properties) or through usbmuxd. Retry every couple of
@@ -2492,9 +2666,156 @@ static void usb_device_key(char *out, size_t size,
 		snprintf(out, size, "usbid:%ld", d->id);
 }
 
+/* --- Bound sources: finding the phone --------------------------------- */
+
+/*
+ * Addresses (and USB device keys) where some *other* phone answered. The
+ * app hands its stream to the newest connection, so redialing one every
+ * round would keep knocking that phone off whatever it is streaming to.
+ * Each is left alone for a minute — unless Bonjour says the bound phone
+ * itself is now there.
+ */
+#define REJECT_MAX 16
+#define REJECT_BACKOFF_NS (60 * 1000000000ULL)
+
+struct reject_list {
+	struct {
+		char key[128];
+		uint64_t until;
+	} e[REJECT_MAX];
+	int count;
+};
+
+static int reject_find(const struct reject_list *l, const char *key)
+{
+	for (int i = 0; i < l->count; i++)
+		if (strcmp(l->e[i].key, key) == 0)
+			return i;
+	return -1;
+}
+
+static void reject_add(struct reject_list *l, const char *key)
+{
+	if (!key[0])
+		return;
+	int i = reject_find(l, key);
+	if (i < 0) {
+		if (l->count < REJECT_MAX) {
+			i = l->count++;
+		} else {
+			i = 0; /* full: replace the soonest to expire */
+			for (int k = 1; k < l->count; k++)
+				if (l->e[k].until < l->e[i].until)
+					i = k;
+		}
+		snprintf(l->e[i].key, sizeof(l->e[i].key), "%s", key);
+	}
+	l->e[i].until = os_gettime_ns() + REJECT_BACKOFF_NS;
+}
+
+static bool reject_active(const struct reject_list *l, const char *key)
+{
+	int i = reject_find(l, key);
+	return i >= 0 && os_gettime_ns() < l->e[i].until;
+}
+
+static bool reject_any_active(const struct reject_list *l)
+{
+	uint64_t now = os_gettime_ns();
+	for (int i = 0; i < l->count; i++)
+		if (now < l->e[i].until)
+			return true;
+	return false;
+}
+
+#define MAX_DIAL_CANDIDATES 3
+
+/* The Wi-Fi addresses a bound source tries in one round, best first. */
+struct dial_plan {
+	char hosts[MAX_DIAL_CANDIDATES][128];
+	int count;
+	int next;
+};
+
+static void plan_add(struct dial_plan *p, const char *host)
+{
+	if (!host[0] || p->count >= MAX_DIAL_CANDIDATES)
+		return;
+	for (int i = 0; i < p->count; i++)
+		if (strcmp(p->hosts[i], host) == 0)
+			return;
+	snprintf(p->hosts[p->count++], sizeof(p->hosts[0]), "%s", host);
+}
+
+/*
+ * One round of address resolution for a bound source (docs/PROTOCOL.md,
+ * "Device identity"):
+ *
+ *   1. Bonjour — the address currently advertising the bound device id;
+ *   2. the address cache — where the phone last proved its id;
+ *   3. the Phone field, if the user typed an address there.
+ *
+ * 2 and 3 are skipped while another phone answering there is in its
+ * back-off (reject_list).
+ *
+ * Each is only a place to look; the phone must still prove its id in
+ * HELLO. Runs on the dial thread: the browse returns as soon as the
+ * phone answers, and within ~100 ms of a stop request.
+ */
+static void build_dial_plan(struct ios_camera_source *s, struct dial_plan *p,
+			    const struct reject_list *rejects)
+{
+	struct mdns_result found;
+	char cached[128];
+
+	p->count = 0;
+	p->next = 0;
+	if (mdns_resolve_device(LENSLINK_MDNS_SERVICE, s->bound_device_id,
+				IDENTITY_RESOLVE_MS, &s->stop, &found))
+		plan_add(p, found.host);
+	pthread_mutex_lock(&s->status_mutex);
+	snprintf(cached, sizeof(cached), "%s", s->last_known_host);
+	pthread_mutex_unlock(&s->status_mutex);
+	if (!reject_active(rejects, cached))
+		plan_add(p, cached);
+	if (!reject_active(rejects, s->host))
+		plan_add(p, s->host);
+}
+
+static void set_identity(struct ios_camera_source *s,
+			 enum lenslink_identity_state st)
+{
+	pthread_mutex_lock(&s->status_mutex);
+	s->identity = st;
+	pthread_mutex_unlock(&s->status_mutex);
+}
+
+/* The status line while a bound source looks for its phone. After a
+ * rejection it keeps saying what it saw while that phone's back-off
+ * lasts — "looking" alone would hide that another phone holds the saved
+ * address. No addresses or ids: those are in the diagnostics report. */
+static void set_searching_status(struct ios_camera_source *s)
+{
+	pthread_mutex_lock(&s->status_mutex);
+	enum lenslink_identity_state st = s->identity;
+	pthread_mutex_unlock(&s->status_mutex);
+	if (st == LENSLINK_IDENTITY_MISMATCH)
+		set_status(s, STATUS_TONE_ERROR, "%s", T_("Status.WrongDevice"));
+	else if (st == LENSLINK_IDENTITY_UNIDENTIFIED)
+		set_status(s, STATUS_TONE_ERROR, "%s",
+			   T_("Status.UnidentifiedDevice"));
+	else
+		set_status(s, STATUS_TONE_WAIT, "%s",
+			   T_("Status.LookingForPhone"));
+}
+
 static void dial_loop(struct ios_camera_source *s)
 {
 	bool usb = s->conn_mode == CONN_DIAL_USB;
+	/* Bound to a phone's persistent id (device-identity.h): only a
+	 * phone whose HELLO proves that id is accepted. Unbound sources
+	 * keep the historical behaviour exactly. */
+	bool bound = s->bound_device_id[0] != 0;
 	/* The device we currently own, e.g. "net:192.168.1.5" or "usb:3".
 	 * Held across reconnects; a second source aimed at the same device
 	 * is refused so they don't fight over the one stream the phone can
@@ -2502,6 +2823,20 @@ static void dial_loop(struct ios_camera_source *s)
 	 * each get their own claim and run independently. */
 	char claimed_key[192] = {0};
 	bool claimed = false;
+	/* Bound sources also claim the phone itself ("id:<deviceID>", held
+	 * for the thread's life, so two sources bound to one phone don't
+	 * fight) and, over Wi-Fi, each address only while dialing it
+	 * (`net_key`), so a legacy source aimed at the same IP can't
+	 * collide with it. */
+	bool id_claimed = false;
+	char net_key[192] = {0};
+	struct dial_plan plan = {0};
+	/* Addresses / USB phones that proved to be another phone. */
+	struct reject_list rejects = {0};
+	char dialed[128] = {0};
+
+	set_identity(s, bound ? LENSLINK_IDENTITY_SEARCHING
+			      : LENSLINK_IDENTITY_UNBOUND);
 
 	while (!s->stop) {
 		socket_t sock = OBSC_INVALID_SOCKET;
@@ -2512,15 +2847,28 @@ static void dial_loop(struct ios_camera_source *s)
 		 * show/hide land on OBS threads, so the loop just watches the
 		 * flags rather than being signalled. */
 		if (s->deactivate_hidden && !s->showing) {
-			if (claimed) {
+			if (claimed || id_claimed) {
 				device_release(s);
 				claimed = false;
 				claimed_key[0] = 0;
+				id_claimed = false;
 			}
 			set_status(s, STATUS_TONE_IDLE, "%s",
 				   T_("Status.Paused"));
 			sleep_ms_interruptible(s, 300);
 			continue;
+		}
+
+		if (bound && !id_claimed) {
+			char k[64];
+			snprintf(k, sizeof(k), "id:%s", s->bound_device_id);
+			if (!device_claim(k, s)) {
+				set_status(s, STATUS_TONE_ERROR, "%s",
+					   T_("Status.DeviceBusy"));
+				sleep_ms_interruptible(s, 1000);
+				continue;
+			}
+			id_claimed = true;
 		}
 
 		if (usb) {
@@ -2542,13 +2890,15 @@ static void dial_loop(struct ios_camera_source *s)
 					}
 				}
 				if (chosen < 0) {
-					device_release(s);
+					device_release_key(claimed_key, s);
 					claimed = false;
 					claimed_key[0] = 0;
 				}
 			}
 			/* Claim the pinned phone if set, else the first
-			 * attached phone no other source owns. */
+			 * attached phone no other source owns (and, for a
+			 * bound source, that hasn't already proved to be
+			 * another phone). */
 			if (!claimed) {
 				for (int i = 0; i < n; i++) {
 					if (pinned[0] &&
@@ -2556,6 +2906,8 @@ static void dial_loop(struct ios_camera_source *s)
 						continue;
 					char k[80];
 					usb_device_key(k, sizeof(k), &devs[i]);
+					if (reject_active(&rejects, k))
+						continue;
 					if (device_claim(k, s)) {
 						claimed = true;
 						snprintf(claimed_key,
@@ -2565,6 +2917,17 @@ static void dial_loop(struct ios_camera_source *s)
 						break;
 					}
 				}
+			}
+			if ((!claimed || chosen < 0) && bound && n > 0 &&
+			    reject_any_active(&rejects)) {
+				/* The attached phones proved to be other
+				 * ones: say so, and leave them alone for a
+				 * while. */
+				set_searching_status(s);
+				if (++s->dial_failures >= 2)
+					s->auto_start_armed = true;
+				sleep_ms_interruptible(s, 2000);
+				continue;
 			}
 			if (!claimed || chosen < 0) {
 				const char *why =
@@ -2589,7 +2952,51 @@ static void dial_loop(struct ios_camera_source *s)
 			 * started, or a screen broadcast running). */
 			set_status(s, STATUS_TONE_WAIT, "%s",
 				   T_("Status.USBFound"));
+			dialed[0] = 0;
 			sock = usbmux_connect_device(usb_id, OBSC_USB_PORT);
+		} else if (bound) {
+			if (plan.next >= plan.count) {
+				/* A whole round failed: pace the next one. */
+				if (plan.count) {
+					if (++s->dial_failures >= 2)
+						s->auto_start_armed = true;
+					sleep_ms_interruptible(s, 2000);
+					if (s->stop)
+						continue;
+				}
+				if (!reject_any_active(&rejects))
+					set_identity(
+						s, LENSLINK_IDENTITY_SEARCHING);
+				set_searching_status(s);
+				build_dial_plan(s, &plan, &rejects);
+				if (!plan.count) {
+					/* Not advertised, nothing cached: an
+					 * empty round, paced like a failed
+					 * dial. */
+					if (++s->dial_failures >= 2)
+						s->auto_start_armed = true;
+					sleep_ms_interruptible(s, 1000);
+					continue;
+				}
+			}
+			const char *target = plan.hosts[plan.next++];
+			snprintf(net_key, sizeof(net_key), "net:%s", target);
+			if (!device_claim(net_key, s)) {
+				/* A legacy source is aimed at this address. */
+				net_key[0] = 0;
+				set_status(s, STATUS_TONE_ERROR, "%s",
+					   T_("Status.DeviceBusy"));
+				continue;
+			}
+			pthread_mutex_lock(&s->status_mutex);
+			snprintf(s->resolved_host, sizeof(s->resolved_host),
+				 "%s", target);
+			pthread_mutex_unlock(&s->status_mutex);
+			set_searching_status(s);
+			snprintf(dialed, sizeof(dialed), "%s", target);
+			s->last_dial_error = 0;
+			sock = tcp_dial(&s->last_dial_error, target,
+					OBSC_USB_PORT, &s->stop);
 		} else if (!s->host[0]) {
 			set_status(s, STATUS_TONE_IDLE, "%s",
 				   T_("Status.NoHost"));
@@ -2609,14 +3016,26 @@ static void dial_loop(struct ios_camera_source *s)
 				snprintf(claimed_key, sizeof(claimed_key), "%s",
 					 k);
 			}
+			pthread_mutex_lock(&s->status_mutex);
+			snprintf(s->resolved_host, sizeof(s->resolved_host),
+				 "%s", s->host);
+			pthread_mutex_unlock(&s->status_mutex);
 			set_status(s, STATUS_TONE_WAIT, "%s %s",
 				   T_("Status.Dialing"), s->host);
+			snprintf(dialed, sizeof(dialed), "%s", s->host);
 			s->last_dial_error = 0;
 			sock = tcp_dial(&s->last_dial_error, s->host,
 					OBSC_USB_PORT, &s->stop);
 		}
 
 		if (sock == OBSC_INVALID_SOCKET) {
+			if (bound && !usb) {
+				/* On to the next address; the end of the
+				 * round paces the retries. */
+				device_release_key(net_key, s);
+				net_key[0] = 0;
+				continue;
+			}
 			/* Unreachable — the app is closed, backgrounded, or
 			 * not yet listening. Re-arm auto-start so the camera
 			 * starts the moment the app becomes reachable again
@@ -2631,11 +3050,34 @@ static void dial_loop(struct ios_camera_source *s)
 		s->dial_failures = 0;
 		blog(LOG_INFO, "[lenslink] connected to device (%s)",
 		     usb ? "USB" : "network");
-		set_status(s, STATUS_TONE_WAIT, "%s", T_("Status.Connected"));
+		/* A bound source isn't connected to *its* phone until the
+		 * HELLO says so; keep the search status until then. */
+		if (!bound)
+			set_status(s, STATUS_TONE_WAIT, "%s",
+				   T_("Status.Connected"));
 
 		struct client_state client = {.sock = sock};
+		snprintf(client.host, sizeof(client.host), "%s", dialed);
+		client.dialed_ns = os_gettime_ns();
 
 		while (!s->stop) {
+			/* Until a bound source's phone has proved its id,
+			 * the connection gets timesync only: no queued
+			 * commands, tally, or stream settings reach an
+			 * unverified phone. */
+			bool trusted = !bound || client.accepted;
+			if (!trusted && os_gettime_ns() - client.dialed_ns >
+						IDENTITY_HELLO_TIMEOUT_NS) {
+				blog(LOG_WARNING,
+				     "[lenslink] no HELLO within 5 s from %s; "
+				     "dropping the connection",
+				     dialed[0] ? dialed : "the USB phone");
+				client.identity_reject =
+					LENSLINK_IDENTITY_UNIDENTIFIED;
+				set_identity(s,
+					     LENSLINK_IDENTITY_UNIDENTIFIED);
+				break;
+			}
 			if (s->deactivate_hidden && !s->showing) {
 				/* Hidden: drop the live connection. With
 				 * remote start in play, also stop the camera
@@ -2644,7 +3086,7 @@ static void dial_loop(struct ios_camera_source *s)
 				 * truly idles instead of encoding into a
 				 * dead link. */
 				if (s->auto_start && !s->is_screen_source &&
-				    !client.standby) {
+				    !client.standby && trusted) {
 					send_control_cmd(
 						&client,
 						"{\"cmd\":\"stop_stream\"}");
@@ -2663,10 +3105,12 @@ static void dial_loop(struct ios_camera_source *s)
 				client_flush(&client);
 			recal_tick(s);
 			latency_tick(s, &client);
-			control_tick(s, &client);
-			tally_tick(s, &client);
-			reference_tick(s, &client);
-			screen_fps_tick(s, &client);
+			if (trusted) {
+				control_tick(s, &client);
+				tally_tick(s, &client);
+				reference_tick(s, &client);
+				screen_fps_tick(s, &client);
+			}
 			diag_tick(s, &client);
 			stats_tick(s, &client);
 			if (client.out.failed)
@@ -2678,7 +3122,30 @@ static void dial_loop(struct ios_camera_source *s)
 
 		blog(LOG_INFO, "[lenslink] device connection ended");
 		bool wrong_kind = client.wrong_kind;
+		bool rejected =
+			client.identity_reject != LENSLINK_IDENTITY_UNBOUND;
 		client_disconnect(s, &client);
+
+		if (bound && !usb) {
+			device_release_key(net_key, s);
+			net_key[0] = 0;
+			/* Rejected: on to the round's next address. Lost a
+			 * verified phone: resolve afresh, Bonjour first. */
+			if (rejected)
+				reject_add(&rejects, dialed);
+			else
+				plan.count = plan.next = 0;
+		}
+		if (bound && usb && rejected) {
+			/* Someone else's phone: free it for another source
+			 * and try the next attached one. */
+			reject_add(&rejects, claimed_key);
+			device_release_key(claimed_key, s);
+			claimed = false;
+			claimed_key[0] = 0;
+		}
+		if (client.accepted)
+			rejects.count = 0; /* found our phone: forget */
 
 		/* Rejected for the wrong stream kind: the phone will keep
 		 * offering the same stream, so an immediate redial would spin
@@ -2688,8 +3155,7 @@ static void dial_loop(struct ios_camera_source *s)
 			sleep_ms_interruptible(s, 3000);
 	}
 
-	if (claimed)
-		device_release(s);
+	device_release(s);
 }
 
 static void *server_thread(void *data)
@@ -2892,13 +3358,34 @@ static void ios_camera_update(void *data, obs_data_t *settings)
 	}
 
 	const char *usb_device = obs_data_get_string(settings, S_USB_DEVICE);
+	char bound[LENSLINK_DEVICE_ID_SIZE];
+	read_bound_device_id(settings, bound);
+	bool rebound = strcmp(bound, s->bound_device_id) != 0;
 	if (mode != s->conn_mode || strcmp(host, s->host) != 0 ||
-	    strcmp(usb_device, s->usb_device) != 0) {
+	    strcmp(usb_device, s->usb_device) != 0 || rebound) {
 		stop_thread(s);
 		s->conn_mode = mode;
 		snprintf(s->host, sizeof(s->host), "%s", host);
 		snprintf(s->usb_device, sizeof(s->usb_device), "%s",
 			 usb_device);
+		if (rebound) {
+			/* A different phone: its address cache comes from
+			 * the settings (the binder cleared or set it). An
+			 * unchanged binding keeps the live cache, which may
+			 * be newer than the last save. */
+			pthread_mutex_lock(&s->status_mutex);
+			snprintf(s->bound_device_id, sizeof(s->bound_device_id),
+				 "%s", bound);
+			snprintf(s->last_known_host,
+				 sizeof(s->last_known_host), "%s",
+				 obs_data_get_string(settings,
+						     S_LAST_KNOWN_HOST));
+			s->peer_device_id[0] = 0;
+			pthread_mutex_unlock(&s->status_mutex);
+			blog(LOG_INFO, "[lenslink] '%s' is now %s",
+			     obs_source_get_name(s->source),
+			     bound[0] ? "bound to a device" : "unbound");
+		}
 		start_thread(s);
 	}
 }
@@ -2925,6 +3412,9 @@ static void *ios_camera_create(obs_data_t *settings, obs_source_t *source)
 			  sizeof(s->host));
 	snprintf(s->usb_device, sizeof(s->usb_device), "%s",
 		 obs_data_get_string(settings, S_USB_DEVICE));
+	read_bound_device_id(settings, s->bound_device_id);
+	snprintf(s->last_known_host, sizeof(s->last_known_host), "%s",
+		 obs_data_get_string(settings, S_LAST_KNOWN_HOST));
 	obs_source_set_async_unbuffered(
 		source, obs_data_get_bool(settings, S_LOW_LATENCY));
 	s->hw_decode = obs_data_get_bool(settings, S_HW_DECODE);
@@ -3024,9 +3514,30 @@ static void ios_camera_get_defaults(obs_data_t *settings)
 	obs_data_set_default_bool(settings, S_DEACTIVATE_HIDDEN, false);
 	obs_data_set_default_bool(settings, S_AUTO_START, true);
 	obs_data_set_default_int(settings, S_SCREEN_FPS, 60);
+	/* Identity: unbound by default — every source saved before
+	 * identities existed loads as exactly what it was. */
+	obs_data_set_default_string(settings, S_DEVICE_ID, "");
+	obs_data_set_default_string(settings, S_LAST_KNOWN_HOST, "");
 	/* Bookkeeping, not a user control: set (never cleared) after the
 	 * green-screen chroma-key filter has been auto-added once. */
 	obs_data_set_default_bool(settings, S_GS_FILTER_ADDED, false);
+}
+
+/* Scene-collection save (UI thread): writes back the address cache the
+ * dial thread keeps, so a restarted OBS tries the phone's last proven
+ * address when Bonjour can't find it. Only for bound sources, and never
+ * an empty value over a saved one; nothing else is rewritten. */
+static void ios_camera_save(void *data, obs_data_t *settings)
+{
+	struct ios_camera_source *s = data;
+	char host[128];
+
+	pthread_mutex_lock(&s->status_mutex);
+	bool bound = s->bound_device_id[0] != 0;
+	snprintf(host, sizeof(host), "%s", s->last_known_host);
+	pthread_mutex_unlock(&s->status_mutex);
+	if (bound && host[0])
+		obs_data_set_string(settings, S_LAST_KNOWN_HOST, host);
 }
 
 static bool add_audio_source(void *data, obs_source_t *source)
@@ -3703,6 +4214,7 @@ struct obs_source_info ios_camera_source_info = {
 	.create = ios_camera_create,
 	.destroy = ios_camera_destroy,
 	.update = ios_camera_update,
+	.save = ios_camera_save,
 	.get_defaults = ios_camera_get_defaults,
 	.get_properties = ios_camera_get_properties,
 	.show = ios_camera_show,
@@ -3721,6 +4233,7 @@ struct obs_source_info lenslink_screen_source_info = {
 	.create = ios_camera_create,
 	.destroy = ios_camera_destroy,
 	.update = ios_camera_update,
+	.save = ios_camera_save,
 	.get_defaults = ios_camera_get_defaults,
 	.get_properties = lenslink_screen_get_properties,
 	.show = ios_camera_show,

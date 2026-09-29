@@ -13,7 +13,11 @@
  * Consumers never hold a `struct ios_camera_source *`. They address a
  * source by its runtime id — a small integer assigned at creation, unique
  * for the life of the OBS process and never reused — and every call
- * resolves the id under the registry lock. A source unregisters first
+ * resolves the id under the registry lock. Runtime ids are opaque and
+ * session-local: never persisted, never meaningful across OBS launches,
+ * and unrelated to a phone's persistent deviceID (device-identity.h),
+ * which is what a source is *bound* to. They are uint32_t, so they stay
+ * exact in JavaScript (below 2^53) wherever the web API exposes them. A source unregisters first
  * thing in destroy, so once that returns no call can reach it; a call
  * for a gone id simply fails. That is the whole lifetime contract, and it
  * is the same one the web panel and the health snapshots each used to
@@ -34,6 +38,7 @@
 #include <stdint.h>
 
 #include "camera-state.h"
+#include "device-identity.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -57,8 +62,26 @@ enum ios_camera_status_tone {
  * source that needs it) with lenslink_source_get_camera_state. */
 struct lenslink_source_info {
 	uint32_t id;            /* runtime id; never 0 for a real source */
-	char source_name[128];  /* the OBS source's (user-editable) name */
-	char device[64];        /* phone name from HELLO; "" if unknown */
+	char source_name[128];  /* the OBS source's (user-editable) name —
+				 * the production role, e.g. "Stage Left" */
+	char device_name[64];   /* connected phone's display name (HELLO);
+				 * "" if unknown. Changes when the phone is
+				 * renamed — display only, never identity. */
+
+	/* Persistent identity (device-identity.h). `device_id` is the
+	 * phone this source is bound to, "" for an unbound (legacy) source
+	 * that accepts whatever answers at its address ("INVALID" if the
+	 * saved setting is malformed: bound, matching no phone — it fails
+	 * closed). `peer_device_id` is
+	 * what the phone on the current connection announced — or, after an
+	 * identity rejection, what the rejected phone announced ("" = none:
+	 * an older app, or nothing connected). `resolved_host` is the Wi-Fi
+	 * address last dialed ("" for USB, or before the first dial). Raw
+	 * ids are for diagnostics, not for normal UI text. */
+	char device_id[LENSLINK_DEVICE_ID_SIZE];
+	char peer_device_id[LENSLINK_DEVICE_ID_SIZE];
+	char resolved_host[128];
+	enum lenslink_identity_state identity;
 	char status[1024];      /* the source's status line (translated) */
 	enum ios_camera_status_tone tone;
 
@@ -166,6 +189,15 @@ bool lenslink_source_set_auto_start(uint32_t id, bool on);
 /* Drops the locked lip-sync mic figure and measures afresh. */
 bool lenslink_source_recalibrate(uint32_t id);
 
+/* Binds the source to the phone with persistent `device_id` (any case;
+ * stored canonical), or unbinds it with NULL/"". Persisted in the
+ * source's settings; the source reconnects, and from then on accepts
+ * only a phone whose HELLO proves that id. This is an explicit
+ * operation for a setup flow to call after the user picked a phone —
+ * nothing binds a source implicitly. False if the id is gone or
+ * `device_id` is not a valid UUID. */
+bool lenslink_source_bind_device(uint32_t id, const char *device_id);
+
 /* ===================================================================== */
 /* Provider side — for ios-camera-source.c only.                          */
 /* ===================================================================== */
@@ -200,6 +232,9 @@ void ios_camera_enqueue_control(struct ios_camera_source *s, const char *json,
 				size_t len);
 void ios_camera_set_auto_start(struct ios_camera_source *s, bool on);
 void ios_camera_recalibrate(struct ios_camera_source *s);
+/* `device_id` is canonical, or "" to unbind. */
+void ios_camera_bind_device(struct ios_camera_source *s,
+			    const char *device_id);
 
 #ifdef __cplusplus
 }

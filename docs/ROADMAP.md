@@ -64,7 +64,10 @@ packet and required for CONTROL — plus optional TLS via `NWProtocolTLS`
 with a pinned self-signed cert — would make the app safe on shared
 networks (dorms, offices, event venues). Designed as opt-in ("Require
 pairing" toggle) to keep the zero-config home path frictionless. *The
-right thing to ship before promoting remote start heavily.*
+right thing to ship before promoting remote start heavily.* The token
+attaches to the persistent `deviceID` a source is already bound to
+(`docs/PROTOCOL.md`, "Device identity"), which today catches accidents
+(a stale address now held by another phone) but proves nothing.
 
 ## Performance
 

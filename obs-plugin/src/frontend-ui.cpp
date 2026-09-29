@@ -118,7 +118,7 @@ void refresh()
 		const lenslink_source_info &h = list[i];
 
 		QString who = QString::fromUtf8(
-			h.device[0] ? h.device : h.source_name);
+			h.device_name[0] ? h.device_name : h.source_name);
 		if (h.connected && !h.standby) {
 			bar_parts << QStringLiteral("%1 %2").arg(
 				who, rates_text(h));
@@ -135,10 +135,10 @@ void refresh()
 		dock_rows << QStringLiteral("<b>%1</b>%2<br/>%3")
 				     .arg(QString::fromUtf8(h.source_name)
 						  .toHtmlEscaped(),
-					  h.device[0] ? QStringLiteral(
+					  h.device_name[0] ? QStringLiteral(
 							      " — %1")
 							      .arg(QString::fromUtf8(
-									   h.device)
+									   h.device_name)
 									   .toHtmlEscaped())
 						      : QString(),
 					  detail);

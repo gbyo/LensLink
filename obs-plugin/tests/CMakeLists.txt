@@ -35,7 +35,8 @@ add_test(NAME mdns-parse COMMAND test-mdns-parse)
 # bundled FFmpeg at load time. Its provider upcalls are stubbed in the
 # test. Windows links libobs for w32-pthreads.
 add_executable(test-source-registry test-source-registry.c
-                                    ${_src}/source-registry.c)
+                                    ${_src}/source-registry.c
+                                    ${_src}/device-identity.c)
 target_include_directories(test-source-registry PRIVATE ${_src}
   $<TARGET_PROPERTY:OBS::libobs,INTERFACE_INCLUDE_DIRECTORIES>)
 target_link_libraries(test-source-registry PRIVATE Threads::Threads)

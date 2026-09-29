@@ -448,6 +448,57 @@ The deviceID is an identifier, not a credential: anything on the LAN can
 claim any id. It protects against *accidents* — a stale address now
 belonging to another phone — not against an attacker.
 
+### Bound sources (plugin)
+
+A LensLink source is either **unbound** — its `device_id` setting is
+empty, as for every source saved before identities existed — or
+**bound** to one deviceID. An unbound source behaves exactly as before:
+it dials the Phone field's address (or USB) and accepts whatever
+LensLink app answers there. Nothing binds a source implicitly; binding is
+an explicit operation (`lenslink_source_bind_device`, for a setup flow to
+call once the user has picked a phone).
+
+A bound source's settings hold `device_id` (authoritative) and
+`last_known_host` (an address cache, never identity). Over Wi-Fi each
+connection round tries, in order:
+
+1. the address Bonjour reports for the bound id right now (a browse of up
+   to 1 s that returns as soon as the phone answers);
+2. `last_known_host`;
+3. the Phone field's address, if the user typed one.
+
+Whichever answers must then send a HELLO whose `deviceID` equals the bound
+id. Until it does, the plugin believes nothing from the connection
+(video, STATE, audio and requests are ignored) and sends it nothing but
+timesync — no identify, tally or queued commands. Over USB the same check
+applies to each attached phone in turn.
+
+| Source | HELLO `deviceID` | Result |
+|---|---|---|
+| unbound | anything, or absent | accepted (the historical behaviour) |
+| bound to A | A | accepted |
+| bound to A | B | rejected: "a different LensLink phone answered" |
+| bound to A | absent or malformed | rejected: the phone can't confirm it is A (an app older than device identity) |
+| bound to A | no HELLO within 5 s | dropped, as unconfirmed |
+
+A rejection never changes `device_id` and never moves the source to the
+other phone. The address that answered wrongly is left alone for a minute
+— the app hands its stream to its newest connection, so redialing would
+keep interrupting that phone's own stream — unless Bonjour reports the
+bound phone there. `last_known_host` is rewritten only after a HELLO has
+proved the id (a Bonjour answer alone never moves it), and saved with the
+scene collection. The search runs on the source's existing dial thread,
+between reconnect attempts; there is no background discovery thread.
+
+Two sources bound to the same phone can't both use it: the second shows
+"already used by another LensLink source", as for two sources aimed at
+one address.
+
+Compatibility: an old plugin ignores `deviceID` and the TXT keys; a new
+plugin with an old app works for unbound sources and refuses to treat the
+unidentified app as a bound source's phone. No protocol version change is
+involved — both additions are optional fields that older peers ignore.
+
 ## USB transport
 
 The packet protocol is identical over USB. The plugin reaches the app's

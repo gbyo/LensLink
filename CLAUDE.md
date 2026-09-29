@@ -200,7 +200,15 @@ and idle, waiting for remote start". Points that shape the code:
   restart.
 - Transports: plain LAN dial, `usbmux.c` (usbmuxd client for USB),
   `mdns.c` (one-shot Bonjour browse of `_lenslink._tcp` for the Phone
-  dropdown).
+  dropdown and for resolving a bound source's device id; the untrusted
+  reply is parsed by `mdns-parse.c`).
+- Device identity (`device-identity.c`, docs/PROTOCOL.md "Device
+  identity"): a source is unbound (legacy: accepts whoever answers at its
+  address) or bound to one phone's persistent `deviceID`, which the
+  phone must repeat in HELLO before anything from it is believed. Never
+  confuse the deviceID with the registry's runtime id (session-local), the
+  phone's name (display only), or an IP (a cache). HELLO and VIDEO_CONFIG
+  are parsed by `handshake.c` on the same bounded reader as STATE.
 - `source-registry.c` is the one registry of live LensLink sources and
   the one API every surface uses to read and operate them: runtime ids
   (never reused), snapshots, typed camera STATE, queued commands, safe

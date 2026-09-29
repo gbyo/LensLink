@@ -182,9 +182,26 @@ static void append_sources(struct dstr *d)
 			  h[i].source_name);
 		dstr_catf(d, "  status:    %s\n", h[i].status);
 		dstr_catf(d, "  device:    %s\n",
-			  h[i].device[0] ? h[i].device : "(unknown)");
-		dstr_catf(d, "  transport: %s\n",
-			  h[i].transport[0] ? h[i].transport : "(none)");
+			  h[i].device_name[0] ? h[i].device_name : "(unknown)");
+		dstr_catf(d, "  transport: %s%s%s\n",
+			  h[i].transport[0] ? h[i].transport : "(none)",
+			  h[i].resolved_host[0] ? ", last dialed " : "",
+			  h[i].resolved_host);
+		/* The ids are what support needs to tell "wrong phone at the
+		 * cached address" from "phone not on the network". */
+		const char *peer = h[i].peer_device_id;
+		if (h[i].device_id[0]) {
+			bool other = peer[0] && strcmp(peer, h[i].device_id);
+			dstr_catf(d, "  identity:  bound to %s — %s%s%s\n",
+				  h[i].device_id,
+				  lenslink_identity_state_name(h[i].identity),
+				  other ? ", phone reached is " : "",
+				  other ? peer : "");
+		} else {
+			dstr_catf(d, "  identity:  unbound (accepts any phone at "
+				     "its address)%s%s\n",
+				  peer[0] ? "; phone is " : "", peer);
+		}
 		dstr_catf(d, "  state:     %s%s\n",
 			  h[i].connected ? "connected" : "not connected",
 			  h[i].standby ? ", camera idle (standby)" : "");

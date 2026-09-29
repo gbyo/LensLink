@@ -21,6 +21,10 @@ struct ios_camera_source {
 	atomic_int controls;
 	atomic_int recalibrations;
 	atomic_bool auto_start;
+	/* Identity, under `lock` like the real source's status_mutex. */
+	pthread_mutex_t lock;
+	char device_id[LENSLINK_DEVICE_ID_SIZE];
+	atomic_int binds;
 };
 
 static atomic_int g_dead_touches;
@@ -45,6 +49,11 @@ void ios_camera_fill_info(struct ios_camera_source *s,
 	touch(s);
 	snprintf(out->source_name, sizeof(out->source_name), "%s", s->name);
 	out->auto_start = atomic_load(&s->auto_start);
+	pthread_mutex_lock(&s->lock);
+	snprintf(out->device_id, sizeof(out->device_id), "%s", s->device_id);
+	out->identity = s->device_id[0] ? LENSLINK_IDENTITY_SEARCHING
+					: LENSLINK_IDENTITY_UNBOUND;
+	pthread_mutex_unlock(&s->lock);
 }
 
 void ios_camera_copy_camera_state(struct ios_camera_source *s,
@@ -89,6 +98,16 @@ void ios_camera_recalibrate(struct ios_camera_source *s)
 	atomic_fetch_add(&s->recalibrations, 1);
 }
 
+void ios_camera_bind_device(struct ios_camera_source *s,
+			    const char *device_id)
+{
+	touch(s);
+	pthread_mutex_lock(&s->lock);
+	snprintf(s->device_id, sizeof(s->device_id), "%s", device_id);
+	pthread_mutex_unlock(&s->lock);
+	atomic_fetch_add(&s->binds, 1);
+}
+
 /* --------------------------------------------------------------------- */
 
 static struct ios_camera_source *make(const char *name, bool screen)
@@ -96,6 +115,7 @@ static struct ios_camera_source *make(const char *name, bool screen)
 	struct ios_camera_source *s = calloc(1, sizeof(*s));
 	snprintf(s->name, sizeof(s->name), "%s", name);
 	s->screen = screen;
+	pthread_mutex_init(&s->lock, NULL);
 	return s;
 }
 
@@ -178,6 +198,55 @@ static void test_basics(void)
 	free(c);
 }
 
+#define ID_A "B1092868-1234-5678-ABCD-0123456789AB"
+#define ID_B "0F5E2D4C-9A8B-4C7D-8E6F-102030405060"
+
+static void test_bind(void)
+{
+	struct ios_camera_source *a = make("Stage Left", false);
+	uint32_t ia = lenslink_registry_add(a);
+	struct lenslink_source_info info;
+
+	/* Unbound by default. */
+	CHECK(lenslink_source_get_info(ia, &info));
+	CHECK(!info.device_id[0] &&
+	      info.identity == LENSLINK_IDENTITY_UNBOUND);
+
+	/* Bound: stored canonical (upper case). */
+	CHECK(lenslink_source_bind_device(
+		ia, "b1092868-1234-5678-abcd-0123456789ab"));
+	CHECK(lenslink_source_get_info(ia, &info));
+	CHECK_STR(info.device_id, ID_A);
+	CHECK(info.identity == LENSLINK_IDENTITY_SEARCHING);
+
+	/* Invalid ids never reach the source; the binding stands. */
+	int binds = atomic_load(&a->binds);
+	CHECK(!lenslink_source_bind_device(ia, "not-a-uuid"));
+	CHECK(!lenslink_source_bind_device(
+		ia, "00000000-0000-0000-0000-000000000000"));
+	CHECK(!lenslink_source_bind_device(ia, ID_A " "));
+	CHECK(atomic_load(&a->binds) == binds);
+	CHECK(lenslink_source_get_info(ia, &info));
+	CHECK_STR(info.device_id, ID_A);
+
+	/* Unbind with "" or NULL. */
+	CHECK(lenslink_source_bind_device(ia, ""));
+	CHECK(lenslink_source_get_info(ia, &info) && !info.device_id[0]);
+	CHECK(lenslink_source_bind_device(ia, ID_B));
+	CHECK(lenslink_source_bind_device(ia, NULL));
+	CHECK(lenslink_source_get_info(ia, &info) && !info.device_id[0]);
+
+	/* The runtime id and the persistent id are unrelated: rebinding
+	 * doesn't change the runtime id, and a gone runtime id can't be
+	 * bound. */
+	CHECK(lenslink_source_bind_device(ia, ID_B));
+	CHECK(lenslink_source_get_info(ia, &info) && info.id == ia);
+	destroy(a);
+	CHECK(!lenslink_source_bind_device(ia, ID_A));
+	CHECK(atomic_load(&g_dead_touches) == 0);
+	free(a);
+}
+
 static void test_command_json(void)
 {
 	CHECK_STR(lenslink_stream_command_json(LENSLINK_STREAM_START),
@@ -214,6 +283,7 @@ static void test_capacity(void)
 
 #define CHURN_ROUNDS 20000
 static atomic_bool g_stop;
+static atomic_int g_torn;
 
 static void *reader_thread(void *arg)
 {
@@ -235,6 +305,19 @@ static void *reader_thread(void *arg)
 						       LENSLINK_STREAM_RESUME);
 			lenslink_source_recalibrate(id);
 			lenslink_source_get_obs_source(id);
+			/* Identity fields are never torn: a bound id is
+			 * whole and valid, and matches the state. */
+			lenslink_source_bind_device(id, (id & 1) ? ID_A : "");
+			struct lenslink_source_info info;
+			if (lenslink_source_get_info(id, &info)) {
+				bool bound = info.device_id[0] != 0;
+				if (bound && !lenslink_device_id_valid(
+						     info.device_id))
+					atomic_fetch_add(&g_torn, 1);
+				if (bound != (info.identity !=
+					      LENSLINK_IDENTITY_UNBOUND))
+					atomic_fetch_add(&g_torn, 1);
+			}
 		}
 		lenslink_source_resolve_camera(0);
 	}
@@ -274,12 +357,14 @@ static void test_concurrent_churn(void)
 	free(graveyard);
 
 	CHECK(atomic_load(&g_dead_touches) == 0);
+	CHECK(atomic_load(&g_torn) == 0);
 	CHECK(lenslink_source_camera_count() == 0);
 }
 
 int main(void)
 {
 	test_basics();
+	test_bind();
 	test_command_json();
 	test_capacity();
 	test_concurrent_churn();

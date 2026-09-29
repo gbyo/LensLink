@@ -74,7 +74,27 @@ lenslink_fuzz(json ${_src}/handshake.c ${_src}/camera-state.c
 lenslink_fuzz(mdns ${_src}/mdns-parse.c ${_src}/device-identity.c)
 
 # The dock's logic, split from its widgets so it needs neither Qt nor
-# libobs: the scene walk behind the Preview tally.
+# libobs: the scene walk behind the Preview tally, the persisted camera
+# order, and the model that turns registry snapshots into cards.
 add_executable(test-scene-walk test-scene-walk.c ${_src}/scene-walk.c)
 target_include_directories(test-scene-walk PRIVATE ${_src})
 add_test(NAME scene-walk COMMAND test-scene-walk)
+
+add_executable(test-rig-order test-rig-order.c ${_src}/rig-order.c
+                              ${_src}/scene-walk.c)
+target_include_directories(test-rig-order PRIVATE ${_src})
+add_test(NAME rig-order COMMAND test-rig-order)
+
+add_executable(test-rig-model test-rig-model.c ${_src}/rig-model.c
+                              ${_src}/rig-order.c ${_src}/scene-walk.c
+                              ${_src}/camera-state.c ${_src}/json-reader.c
+                              ${_src}/device-identity.c)
+target_include_directories(test-rig-model PRIVATE ${_src})
+# The real English strings: the test fails on a key the model asks for
+# that en-US.ini doesn't define.
+target_compile_definitions(test-rig-model PRIVATE
+  LENSLINK_EN_INI="${CMAKE_CURRENT_SOURCE_DIR}/../data/locale/en-US.ini")
+if(NOT WIN32)
+  target_link_libraries(test-rig-model PRIVATE m)
+endif()
+add_test(NAME rig-model COMMAND test-rig-model)

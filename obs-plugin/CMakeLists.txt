@@ -73,6 +73,8 @@ add_library(${PROJECT_NAME} MODULE
   src/mdns-parse.c
   src/scene-walk.c
   src/scene-walk-obs.c
+  src/rig-order.c
+  src/rig-model.c
   src/protocol.h
   src/web-control.h
   src/lipsync.h
@@ -90,6 +92,8 @@ add_library(${PROJECT_NAME} MODULE
   src/lenslink-uuid.h
   src/scene-walk.h
   src/scene-walk-obs.h
+  src/rig-order.h
+  src/rig-model.h
 )
 
 target_link_libraries(${PROJECT_NAME} PRIVATE OBS::libobs ${FFMPEG_TARGET})

@@ -798,16 +798,32 @@ final class Streamer: ObservableObject {
     private var stateSendPending = false
 
     private func scheduleStateSend() {
-        guard isStreaming, !stateSendPending else { return }
+        guard canSendState, !stateSendPending else { return }
         stateSendPending = true
         Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 200_000_000)
             guard let self else { return }
             self.stateSendPending = false
-            guard self.isStreaming else { return }
-            self.client.sendState(self.controlStateSnapshot())
-            self.rememberCurrentSettings(for: self.selectedLens.id)
+            if self.isStreaming {
+                self.client.sendState(self.controlStateSnapshot())
+                self.rememberCurrentSettings(for: self.selectedLens.id)
+            } else if self.canSendState,
+                      self.telemetry != self.lastStandbyTelemetry {
+                // Standby: nothing but telemetry to say, and only when it
+                // differs from what this connection last heard — a
+                // setting changed on the Options screen schedules a send
+                // too, and repeating an identical snapshot is just noise.
+                self.lastStandbyTelemetry = self.telemetry
+                self.client.sendState(self.telemetry.wireFields)
+            }
         }
+    }
+
+    /// STATE goes out while streaming, and — telemetry only — while OBS
+    /// is connected to the idle app in standby, so an operator sees a
+    /// dying or overheating phone before they start its camera.
+    private var canSendState: Bool {
+        isStreaming || (standbyActive && lastClientState == .connected)
     }
 
     private func controlStateSnapshot() -> [String: Any] {
@@ -906,6 +922,10 @@ final class Streamer: ObservableObject {
             state["mic"] = selectedMicID
             state["mics"] = micOptions.map { ["id": $0.id, "name": $0.name] }
         }
+        // Phone health (docs/PROTOCOL.md §8, "Telemetry"): power, the
+        // device's thermal state, and the camera's system pressure —
+        // three facts, never merged. Unknown ones are simply absent.
+        state.merge(telemetry.wireFields) { _, new in new }
         return state
     }
 
@@ -1287,20 +1307,9 @@ final class Streamer: ObservableObject {
                 self?.handleClientState(state)
             }
         }
-        camera.onSystemPressure = { [weak self] level in
+        camera.onSystemPressure = { [weak self] update in
             Task { @MainActor [weak self] in
-                guard let self else { return }
-                // .serious halves the bitrate; .critical quarters it (on
-                // top of CameraManager halving the frame rate). The
-                // adaptive loop applies the cap within a second and ramps
-                // back up after recovery.
-                switch level {
-                case .serious: self.thermalBitrateScale = 0.5
-                case .critical: self.thermalBitrateScale = 0.25
-                default: self.thermalBitrateScale = 1.0
-                }
-                print("System pressure \(level.rawValue) -> "
-                      + "bitrate scale \(self.thermalBitrateScale)")
+                self?.handleSystemPressure(update)
             }
         }
         client.onDiscoveryChange = { [weak self] discoverable in
@@ -1382,6 +1391,134 @@ final class Streamer: ObservableObject {
         }
     }
 
+    // MARK: - Telemetry (docs/PROTOCOL.md §8)
+    //
+    // Power and capture health, reported to OBS in STATE — reporting only:
+    // nothing below changes what the camera or encoder does.
+    //
+    //   ProcessInfo thermal notification ─┐
+    //   BatteryMonitor (level/plug/LPM)  ─┼→ `telemetry` → scheduleStateSend()
+    //   the camera's pressure observation ┘                    → STATE
+    //
+    // All event-driven; there is no timer. Battery, Low Power Mode and
+    // thermal state are only watched while an OBS connection is up and
+    // could use them (a lease, below); the pressure observation already
+    // exists for throttling and runs regardless.
+
+    private var telemetry = StreamTelemetry()
+    /// What this standby connection last heard, so an unchanged snapshot
+    /// isn't repeated. Cleared whenever the connection is not live, so a
+    /// fresh connection always gets one.
+    private var lastStandbyTelemetry: StreamTelemetry?
+    private var holdsTelemetryLease = false
+    private var batteryObservation: AnyCancellable?
+    private var thermalObserver: NSObjectProtocol?
+
+    /// Whether anyone is listening: OBS is connected, either to a running
+    /// stream or to the idle app in standby.
+    private var telemetryWanted: Bool {
+        lastClientState == .connected && (isStreaming || standbyActive)
+    }
+
+    /// Takes or drops the battery/thermal watch to match `telemetryWanted`.
+    /// Idempotent, so any state change can just call it. The Live screen
+    /// holds its own `BatteryMonitor` retain; the refcount keeps the two
+    /// independent.
+    private func updateTelemetryLease() {
+        if !telemetryWanted { lastStandbyTelemetry = nil }
+        guard telemetryWanted != holdsTelemetryLease else { return }
+        holdsTelemetryLease = telemetryWanted
+        let center = NotificationCenter.default
+        if holdsTelemetryLease {
+            let battery = BatteryMonitor.shared
+            battery.retain()
+            // Seed synchronously (no send): the on-connect STATE goes out
+            // immediately and should already carry them.
+            telemetry.batteryPercent = battery.percent
+            telemetry.batteryState = battery.state
+            telemetry.lowPowerMode = battery.lowPowerMode
+            telemetry.thermalState = StreamTelemetry.ThermalState(
+                ProcessInfo.processInfo.thermalState)
+            // Published emits its value on subscribe (the seed above) and
+            // again per change; BatteryMonitor's writes are main-queue.
+            batteryObservation = Publishers.CombineLatest3(
+                battery.$percent, battery.$state, battery.$lowPowerMode)
+                .dropFirst()
+                .sink { [weak self] percent, state, lowPower in
+                    Task { @MainActor [weak self] in
+                        self?.updateTelemetry {
+                            $0.batteryPercent = percent
+                            $0.batteryState = state
+                            $0.lowPowerMode = lowPower
+                        }
+                    }
+                }
+            thermalObserver = center.addObserver(
+                forName: ProcessInfo.thermalStateDidChangeNotification,
+                object: nil, queue: .main) { [weak self] _ in
+                let thermal = StreamTelemetry.ThermalState(
+                    ProcessInfo.processInfo.thermalState)
+                Task { @MainActor [weak self] in
+                    self?.updateTelemetry { $0.thermalState = thermal }
+                }
+            }
+        } else {
+            batteryObservation = nil
+            if let thermalObserver { center.removeObserver(thermalObserver) }
+            thermalObserver = nil
+            BatteryMonitor.shared.release()
+            // Not watched, so not known: never report a stale reading.
+            telemetry.batteryPercent = nil
+            telemetry.batteryState = nil
+            telemetry.lowPowerMode = nil
+            telemetry.thermalState = nil
+        }
+    }
+
+    /// Applies a change and schedules a STATE only if something differs.
+    private func updateTelemetry(_ change: (inout StreamTelemetry) -> Void) {
+        var next = telemetry
+        change(&next)
+        guard next != telemetry else { return }
+        telemetry = next
+        scheduleStateSend()
+    }
+
+    /// The camera's pressure observation: mitigation as it has always
+    /// been, plus the level and its factors reported as telemetry.
+    private func handleSystemPressure(
+        _ update: CameraManager.SystemPressureUpdate) {
+        let state: AVCaptureDevice.SystemPressureState
+        switch update {
+        case .changed(let changed):
+            state = changed
+            // .serious halves the bitrate; .critical quarters it (on
+            // top of CameraManager halving the frame rate). The
+            // adaptive loop applies the cap within a second and ramps
+            // back up after recovery.
+            switch state.level {
+            case .serious: thermalBitrateScale = 0.5
+            case .critical: thermalBitrateScale = 0.25
+            default: thermalBitrateScale = 1.0
+            }
+        case .baseline(let current):
+            state = current
+        }
+        let pressure = StreamTelemetry.SystemPressure(state.level)
+        // Factors only make sense next to a level we understood.
+        let factors = pressure == nil
+            ? [] : StreamTelemetry.PressureFactor.factors(in: state.factors)
+        updateTelemetry {
+            $0.systemPressure = pressure
+            $0.systemPressureFactors = factors
+        }
+        if case .changed = update {
+            print("System pressure "
+                  + StreamTelemetry.describe(pressure, factors)
+                  + " -> bitrate scale \(thermalBitrateScale)")
+        }
+    }
+
     // MARK: - Standby (remote start)
     //
     // While the app is foreground and idle, the listener stays up in
@@ -1435,6 +1572,7 @@ final class Streamer: ObservableObject {
         updateIdleTimer()
         client.setStandby(false)
         client.disconnect()
+        updateTelemetryLease()
         if status == .standby {
             status = .idle
         }
@@ -1730,6 +1868,7 @@ final class Streamer: ObservableObject {
         isStreaming = true
         status = .connecting
         updateIdleTimer()
+        updateTelemetryLease()
 
         camera.start()
         resetCameraControls()
@@ -2005,6 +2144,7 @@ final class Streamer: ObservableObject {
         // auto-starts when the app was previously unreachable, so a manual
         // stop here doesn't bounce straight back into streaming.
         updateStandby()
+        updateTelemetryLease()
     }
 
     /// Last state reported by the client (client.state itself is confined
@@ -2013,6 +2153,9 @@ final class Streamer: ObservableObject {
 
     private func handleClientState(_ state: StreamClient.State) {
         lastClientState = state
+        // First, so the on-connect STATE below already carries battery
+        // and thermal readings.
+        updateTelemetryLease()
         // Tally is only ever as true as the connection carrying it. A
         // "live" light left burning after OBS went away is worse than no
         // light at all, so any state but `connected` clears it; the plugin
@@ -2063,6 +2206,9 @@ final class Streamer: ObservableObject {
             if status == .idle || status == .standby {
                 status = .standby
             }
+            // The plugin has just (re)connected to the idle app: tell it
+            // how the phone is doing.
+            scheduleStateSend()
         case .disconnected, .connecting:
             if status == .standby {
                 status = .idle
@@ -2072,6 +2218,7 @@ final class Streamer: ObservableObject {
             // can't work until something changes.
             standbyActive = false
             updateIdleTimer()
+            updateTelemetryLease()
             client.disconnect()
             status = .error(message)
         }

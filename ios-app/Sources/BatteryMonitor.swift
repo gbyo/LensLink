@@ -12,7 +12,10 @@ import UIKit
 /// (docs/PERFORMANCE.md: no extra threads or timers).
 ///
 /// Monitoring is refcounted rather than left on for the app's life: it is
-/// a device-wide flag, and only the Live screen has anything to show.
+/// a device-wide flag. Two consumers retain it — the Live screen, while
+/// it is showing, and `Streamer`, while an OBS connection is up and needs
+/// the numbers for its STATE telemetry (docs/PROTOCOL.md §8). Neither
+/// depends on the other, and nothing is monitored when neither is there.
 ///
 /// Not @MainActor, for the same reason as `TallySettings`: it is reached
 /// from a view property initializer, which isn't isolated. Every mutation
@@ -23,7 +26,11 @@ final class BatteryMonitor: ObservableObject {
 
     /// 0–100, or nil when iOS won't say (Simulator, or monitoring off).
     @Published private(set) var percent: Int?
-    @Published private(set) var isCharging = false
+    /// The plug state as reported, not folded into a flag: the wire
+    /// telemetry keeps "charging" and "full" apart even though the Live
+    /// screen treats both as "on a cable".
+    @Published private(set) var state = StreamTelemetry.BatteryState.unknown
+    var isCharging: Bool { state == .charging || state == .full }
     @Published private(set) var lowPowerMode = ProcessInfo.processInfo
         .isLowPowerModeEnabled
 
@@ -80,8 +87,7 @@ final class BatteryMonitor: ObservableObject {
         // showing nothing at all.
         percent = device.batteryLevel < 0
             ? nil : Int((device.batteryLevel * 100).rounded())
-        isCharging = device.batteryState == .charging
-            || device.batteryState == .full
+        state = StreamTelemetry.BatteryState(device.batteryState)
         lowPowerMode = ProcessInfo.processInfo.isLowPowerModeEnabled
     }
 }

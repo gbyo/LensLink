@@ -570,17 +570,37 @@ final class CameraManager: NSObject {
         }
     }()
 
-    /// Fires on system-pressure (thermal/power) level changes, on the
-    /// main queue — Streamer scales the bitrate down in response.
-    var onSystemPressure: ((AVCaptureDevice.SystemPressureState.Level) -> Void)?
+    /// What the one system-pressure observation reports. The same
+    /// observation feeds the existing mitigation (Streamer's bitrate
+    /// scale, this class's frame-rate throttle) and the STATE telemetry
+    /// (docs/PROTOCOL.md §8) — there is deliberately no second observer.
+    enum SystemPressureUpdate {
+        /// iOS reported a pressure change. Drives mitigation and
+        /// telemetry, exactly as the level alone always did.
+        case changed(AVCaptureDevice.SystemPressureState)
+        /// A device was just configured and this is its state right now.
+        /// Telemetry only: KVO reports nothing until the *next* change,
+        /// so without this a camera that starts already pressured (or a
+        /// lens switch onto a hotter module) would read as unknown. It is
+        /// not a change, so it triggers no mitigation.
+        case baseline(AVCaptureDevice.SystemPressureState)
+    }
+
+    /// Fires on the main queue for every update above.
+    var onSystemPressure: ((SystemPressureUpdate) -> Void)?
     private var pressureObservation: NSKeyValueObservation?
     private var configuredFps: Int32 = 30
     private var configuredFrameRateLock = true
     private var fpsThrottled = false
 
     private func systemPressureChanged(on device: AVCaptureDevice) {
-        let level = device.systemPressureState.level
+        // One read, so the level and the factors describe the same moment.
+        let state = device.systemPressureState
+        let level = state.level
+        let factors = StreamTelemetry.PressureFactor.factors(in: state.factors)
+            .map { $0.rawValue }
         let line = "System pressure: \(level.rawValue)"
+            + (factors.isEmpty ? "" : " (\(factors.joined(separator: ", ")))")
         Self.log.warning("\(line, privacy: .public)")
         sessionQueue.async { [weak self] in
             guard let self else { return }
@@ -593,7 +613,7 @@ final class CameraManager: NSObject {
                 self.applyFrameRate(divisor: throttle ? 2 : 1)
             }
         }
-        DispatchQueue.main.async { self.onSystemPressure?(level) }
+        DispatchQueue.main.async { self.onSystemPressure?(.changed(state)) }
     }
 
     /// sessionQueue only.
@@ -776,6 +796,11 @@ final class CameraManager: NSObject {
                                              options: [.new]) {
             [weak self] observedDevice, _ in
             self?.systemPressureChanged(on: observedDevice)
+        }
+        // The observation above only reports changes; say where it starts.
+        let baseline = device.systemPressureState
+        DispatchQueue.main.async { [weak self] in
+            self?.onSystemPressure?(.baseline(baseline))
         }
 
         let output = AVCaptureVideoDataOutput()

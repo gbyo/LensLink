@@ -61,6 +61,7 @@ struct out_buf {
 	size_t size; /* 0 = discard everything */
 	size_t len;
 	bool truncated;
+	bool has_nul; /* an escaped \u0000 was decoded */
 };
 
 /* Appends a whole UTF-8 sequence or nothing: once one sequence doesn't
@@ -146,8 +147,18 @@ static bool parse_string(struct json_reader *r, struct out_buf *o)
 
 		if (c == '"') {
 			r->p++;
-			if (o->size)
+			if (o->size) {
+				/* An escaped NUL can't be represented in a C
+				 * string: keeping the part before it would hand
+				 * the caller a *different* value ("a\u0000b"
+				 * read as "a"). The whole value is withheld
+				 * instead, and reported as not representable. */
+				if (o->has_nul) {
+					o->len = 0;
+					o->truncated = true;
+				}
 				o->data[o->len] = 0;
+			}
 			return true;
 		}
 		if (c < 0x20)
@@ -183,6 +194,10 @@ static bool parse_string(struct json_reader *r, struct out_buf *o)
 				uint32_t cp;
 				if (!read_hex4(r, &cp))
 					return fail(r);
+				if (cp == 0) {
+					o->has_nul = true;
+					break;
+				}
 				if (cp >= 0xD800 && cp <= 0xDBFF) {
 					/* A high surrogate needs its low half
 					 * right after; alone it's replaced. */
@@ -245,7 +260,7 @@ bool json_read_string(struct json_reader *r, char *out, size_t out_size,
 {
 	if (json_peek(r) != JSON_TYPE_STRING)
 		return false;
-	struct out_buf o = {out, out ? out_size : 0, 0, false};
+	struct out_buf o = {out, out ? out_size : 0, 0, false, false};
 	if (out && out_size)
 		out[0] = 0;
 	bool ok = parse_string(r, &o);
@@ -345,9 +360,13 @@ bool json_read_number(struct json_reader *r, double *out)
 	if (exponent < -400)
 		exponent = -400;
 
-	double v = exponent < -300 ? mantissa * pow10_int(-300) *
-					     pow10_int(exponent + 300)
-				   : mantissa * pow10_int(exponent);
+	/* Zero stays zero whatever the exponent: "0e999" would otherwise be
+	 * 0 * inf = NaN, which no caller's range clamp catches. */
+	double v = mantissa == 0.0 ? 0.0
+		   : exponent < -300
+			   ? mantissa * pow10_int(-300) *
+				     pow10_int(exponent + 300)
+			   : mantissa * pow10_int(exponent);
 	*out = negative ? -v : v;
 	return true;
 }
@@ -432,7 +451,7 @@ bool json_object_next(struct json_reader *r, char *key, size_t key_size,
 {
 	if (!next_item(r, '}'))
 		return false;
-	struct out_buf o = {key, key ? key_size : 0, 0, false};
+	struct out_buf o = {key, key ? key_size : 0, 0, false, false};
 	if (key && key_size)
 		key[0] = 0;
 	if (!parse_string(r, &o))

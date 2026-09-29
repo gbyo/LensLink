@@ -17,6 +17,14 @@ if(NOT WIN32)
 endif()
 add_test(NAME camera-state COMMAND test-camera-state)
 
+add_executable(test-handshake test-handshake.c ${_src}/handshake.c
+                              ${_src}/device-identity.c ${_src}/json-reader.c)
+target_include_directories(test-handshake PRIVATE ${_src})
+if(NOT WIN32)
+  target_link_libraries(test-handshake PRIVATE m)
+endif()
+add_test(NAME handshake COMMAND test-handshake)
+
 # The registry only needs libobs's threading header (plain pthreads
 # outside Windows) — not the library, which on macOS would drag in OBS's
 # bundled FFmpeg at load time. Its provider upcalls are stubbed in the
@@ -30,3 +38,30 @@ if(WIN32)
   target_link_libraries(test-source-registry PRIVATE OBS::libobs)
 endif()
 add_test(NAME source-registry COMMAND test-source-registry)
+
+# Fuzz harnesses for the parsers of untrusted input (tests/fuzz/). By
+# default each runs under a deterministic mutation driver as an ordinary
+# test; configure with -DLENSLINK_FUZZ_LIBFUZZER=ON (clang with libFuzzer)
+# to build real libFuzzer binaries instead, run by hand.
+option(LENSLINK_FUZZ_LIBFUZZER "Build the fuzz harnesses against libFuzzer" OFF)
+set(LENSLINK_FUZZ_ITERATIONS 200000 CACHE STRING
+    "Mutations per fuzz harness when run by ctest")
+
+function(lenslink_fuzz name)
+  add_executable(fuzz-${name} fuzz/fuzz-${name}.c ${ARGN})
+  target_include_directories(fuzz-${name} PRIVATE ${_src} fuzz)
+  if(NOT WIN32)
+    target_link_libraries(fuzz-${name} PRIVATE m)
+  endif()
+  if(LENSLINK_FUZZ_LIBFUZZER)
+    target_compile_options(fuzz-${name} PRIVATE -fsanitize=fuzzer)
+    target_link_options(fuzz-${name} PRIVATE -fsanitize=fuzzer)
+  else()
+    target_sources(fuzz-${name} PRIVATE fuzz/fuzz-driver.c)
+    add_test(NAME fuzz-${name}
+             COMMAND fuzz-${name} ${LENSLINK_FUZZ_ITERATIONS})
+  endif()
+endfunction()
+
+lenslink_fuzz(json ${_src}/handshake.c ${_src}/camera-state.c
+              ${_src}/json-reader.c ${_src}/device-identity.c)

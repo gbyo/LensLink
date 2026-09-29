@@ -12,6 +12,10 @@
  * The reader walks a bounded buffer (no NUL terminator needed), never
  * reads past `len`, limits nesting depth, and decodes strings into
  * caller-owned buffers, truncating only on a UTF-8 code point boundary.
+ * Decoded strings are always valid UTF-8 (malformed bytes and lone
+ * surrogates become U+FFFD) and never contain a NUL: a string holding an
+ * escaped \u0000 is withheld whole — "" with the truncated flag set —
+ * because any C string made from it would mean something else.
  * Any syntax error latches `error`; every later call then fails, so a
  * caller can check once at the end. Pure C with no libobs dependency, so
  * it can be unit-tested standalone.
@@ -57,7 +61,8 @@ enum json_type json_peek(struct json_reader *r);
  * until it returns false (the closing '}' consumed, or an error). Each
  * true return has read one key and its ':' — the caller must then consume
  * exactly one value (read it or json_skip it). `key_truncated` reports a
- * key that did not fit, which callers should treat as unknown. */
+ * key that did not fit (or held an escaped NUL), which callers should
+ * treat as unknown. */
 bool json_object_begin(struct json_reader *r);
 bool json_object_next(struct json_reader *r, char *key, size_t key_size,
 		      bool *key_truncated);
@@ -68,7 +73,12 @@ bool json_array_begin(struct json_reader *r);
 bool json_array_next(struct json_reader *r);
 
 /* Scalar reads fail (without latching an error) when the next value has
- * a different type, so a caller can fall back to json_skip. */
+ * a different type, so a caller can fall back to json_skip.
+ * json_read_string's `truncated` means "`out` is not the whole value":
+ * it did not fit (`out` holds a prefix), or it contained an escaped NUL
+ * (`out` is ""). A caller that routes, matches or trusts the value must
+ * treat either as invalid. Numbers beyond double range read as ±inf and
+ * tiny ones as 0; callers clamp. */
 bool json_read_string(struct json_reader *r, char *out, size_t out_size,
 		      bool *truncated);
 bool json_read_number(struct json_reader *r, double *out);

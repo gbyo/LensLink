@@ -25,6 +25,11 @@ if(NOT WIN32)
 endif()
 add_test(NAME handshake COMMAND test-handshake)
 
+add_executable(test-mdns-parse test-mdns-parse.c ${_src}/mdns-parse.c
+                               ${_src}/device-identity.c)
+target_include_directories(test-mdns-parse PRIVATE ${_src})
+add_test(NAME mdns-parse COMMAND test-mdns-parse)
+
 # The registry only needs libobs's threading header (plain pthreads
 # outside Windows) — not the library, which on macOS would drag in OBS's
 # bundled FFmpeg at load time. Its provider upcalls are stubbed in the
@@ -65,3 +70,4 @@ endfunction()
 
 lenslink_fuzz(json ${_src}/handshake.c ${_src}/camera-state.c
               ${_src}/json-reader.c ${_src}/device-identity.c)
+lenslink_fuzz(mdns ${_src}/mdns-parse.c ${_src}/device-identity.c)

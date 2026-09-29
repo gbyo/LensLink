@@ -214,10 +214,13 @@ final class StreamClient {
 
         // Advertise over Bonjour so the OBS plugin can discover this
         // phone by name instead of a typed IP. The device name matches
-        // the HELLO; port comes from the service record's socket.
+        // the HELLO; port comes from the service record's socket. The
+        // TXT record says which installation this is, so a bound OBS
+        // source can find it again after its address or name changes.
         if advertise {
             listener.service = NWListener.Service(
-                name: UIDevice.current.name, type: "_lenslink._tcp")
+                name: UIDevice.current.name, type: "_lenslink._tcp",
+                txtRecord: bonjourTXT())
         }
 
         self.listener = listener
@@ -277,6 +280,19 @@ final class StreamClient {
         }
 
         listener.start(queue: queue)
+    }
+
+    /// Identity and capability only (docs/PROTOCOL.md, "Discovery") —
+    /// never state that changes while advertised (battery, bitrate, ...):
+    /// that belongs in STATE over the connection.
+    private func bonjourTXT() -> NWTXTRecord {
+        var txt = NWTXTRecord()
+        if let deviceID {
+            txt["id"] = deviceID
+        }
+        txt["proto"] = String(OBSCProtocol.version)
+        txt["kind"] = sourceKind.rawValue
+        return txt
     }
 
     /// Wires up state handling for a connection (dialed or accepted) and

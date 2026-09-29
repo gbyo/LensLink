@@ -70,6 +70,7 @@ add_library(${PROJECT_NAME} MODULE
   src/json-reader.c
   src/device-identity.c
   src/handshake.c
+  src/mdns-parse.c
   src/protocol.h
   src/web-control.h
   src/lipsync.h
@@ -78,6 +79,7 @@ add_library(${PROJECT_NAME} MODULE
   src/h264-decoder.h
   src/usbmux.h
   src/mdns.h
+  src/mdns-parse.h
   src/device-identity.h
   src/handshake.h
   src/source-registry.h

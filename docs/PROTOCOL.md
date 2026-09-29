@@ -386,12 +386,35 @@ Whenever the app's listener is up (streaming, standby, or a screen
 broadcast), it is advertised over Bonjour as **`_lenslink._tcp`** with the
 device's name as the service instance. The plugin performs a one-shot
 mDNS-SD browse (RFC 6762 §5.1: PTR query from an ephemeral port with the
-unicast-response bit, answers arrive unicast) when the source's
-properties open, and offers discovered phones by name in the Phone
-field. Only the PTR answer's instance label and the responder's source
-address are used — the wire port is fixed — so no SRV/A parsing or
-multicast group membership is required. Typing an IP directly still
-works exactly as before.
+unicast-response bit, answers arrive unicast) — when a source's
+properties open, to offer discovered phones by name in the Phone field,
+and when a source bound to a device needs its current address (see
+[Device identity](#device-identity)). The wire port is fixed and the
+responder's source address is the phone, so SRV and A records are
+ignored and no multicast group membership is required. Typing an IP
+directly still works exactly as before.
+
+The service's TXT record (RFC 6763 §6) identifies and describes the
+service; it is not a telemetry channel — nothing that changes while the
+service is advertised (battery, temperature, bitrate, addresses) goes
+there:
+
+| Key | Value | Meaning |
+|---|---|---|
+| `id` | the deviceID, e.g. `B1092868-1234-5678-ABCD-0123456789AB` | the installation's persistent identity; absent if the app has none |
+| `proto` | `1` | the wire protocol version the listener speaks |
+| `kind` | `camera` or `screen` | what the listener would stream (the app or the broadcast extension) |
+
+Apps older than device identity publish no TXT keys. The plugin reads
+TXT from any section of the reply, matching it to the PTR's instance by
+owner name; keys are case-insensitive and, per RFC 6763 §6.4, the first
+occurrence of a key wins — except `id`, which is ignored altogether if it
+appears twice. An `id` that isn't a valid UUID is ignored. Goodbye
+announcements (TTL 0) are not listed. The reply is untrusted input: it is
+bounds-checked throughout, compression pointers are limited to 16 jumps
+and 255-byte names, and display names are made printable UTF-8. A
+discovered id only chooses which address to dial; the phone must still
+prove it in HELLO.
 
 ## Device identity
 
@@ -411,8 +434,9 @@ after a DHCP move, a rename, a Wi-Fi reconnect, or an OBS restart.
 
 The deviceID is not derived from the hardware or the network — no serial
 number, MAC or IP address, advertising identifier, or
-`identifierForVendor` — and it never leaves the local network: it goes
-only to the plugin, in HELLO. The app keeps
+`identifierForVendor` — and it never leaves the local network: it is
+announced in the Bonjour TXT record and sent to the plugin in HELLO. The
+app keeps
 it in a file in the App Group container it shares with the broadcast
 extension, so both present the same identity; the file is excluded from
 backups, so restoring a backup onto another phone does not clone it. A

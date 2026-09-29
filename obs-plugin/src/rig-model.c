@@ -1,6 +1,5 @@
 #include "rig-model.h"
 
-#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -95,7 +94,7 @@ static void health_numbers(const struct lenslink_source_info *h, char *buf,
 	char part[48];
 	buf[0] = '\0';
 	if (h->has_rates) {
-		snprintf(part, sizeof(part), "%d fps", (int)lround(h->fps));
+		snprintf(part, sizeof(part), "%d fps", (int)(h->fps + 0.5));
 		join(buf, size, part);
 		snprintf(part, sizeof(part), "%.1f Mb/s", h->bitrate_bps / 1e6);
 		join(buf, size, part);

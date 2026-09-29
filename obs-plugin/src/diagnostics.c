@@ -163,6 +163,34 @@ static const char *dial_error_meaning(int err)
 	return NULL;
 }
 
+/* The phone's power and health as the app last reported it. Thermal
+ * state (the whole device) and system pressure (the camera) are separate
+ * facts: a serious pressure is only "thermal" when a temperature factor
+ * says so, and the note below is what keeps a support reader from
+ * chasing heat that was really peak power. */
+static void append_telemetry(struct dstr *d,
+			     const struct lenslink_telemetry *t)
+{
+	char line[192];
+	if (!lenslink_telemetry_any(t))
+		return;
+	lenslink_telemetry_format(t, line, sizeof(line));
+	dstr_catf(d, "  phone:     %s\n", line);
+
+	enum lenslink_pressure_cause cause =
+		lenslink_telemetry_pressure_cause(t);
+	if (cause == LL_PRESSURE_CAUSE_NONE)
+		return;
+	dstr_catf(d, "  NOTE: camera system pressure is %s (cause: %s) — "
+		     "the phone lowers bitrate, and at critical frame rate, "
+		     "to protect capture; that, not the link, may be why "
+		     "quality dropped\n",
+		  lenslink_system_pressure_name(t->system_pressure),
+		  cause == LL_PRESSURE_CAUSE_UNSPECIFIED
+			  ? "not reported"
+			  : lenslink_pressure_cause_name(cause));
+}
+
 static void append_sources(struct dstr *d)
 {
 	struct lenslink_source_info *h =
@@ -223,6 +251,7 @@ static void append_sources(struct dstr *d)
 					     "decode fell back\n",
 					  h[i].hw_retries);
 			dstr_catf(d, "  latency:   %d ms\n", h[i].latency_ms);
+			append_telemetry(d, &h[i].telemetry);
 			if (h[i].green_screen)
 				dstr_cat(d, "  green screen: ON — the phone "
 					    "is painting its background green; "

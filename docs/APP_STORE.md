@@ -203,7 +203,11 @@ GitHub (bug reports, source) and open in Safari. No analytics, no
 crash reporting SDK, no identifiers collected. The random installation
 id the app announces to OBS (`docs/PROTOCOL.md`, "Device identity") is
 created on the phone, isn't derived from the device, and never leaves
-the user's own network — it is not collected in App Store terms.
+the user's own network — it is not collected in App Store terms. The same
+holds for the phone's battery level, charging and Low Power Mode state,
+and thermal/camera-load status, which the app tells the user's OBS
+(`docs/PROTOCOL.md`, "Telemetry") so it can warn before a long stream
+fails: sent only to the connected computer, never to us, never stored.
 
 ## Export compliance
 

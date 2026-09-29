@@ -48,6 +48,7 @@ Read the matching doc before touching an area:
 |--------|-------------|
 | Wire protocol | `docs/PROTOCOL.md` + `obs-plugin/src/protocol.h` + `ios-app/Sources/Protocol.swift` (the constants/enums are hand-mirrored, not generated) |
 | Design tokens, status vocabulary | `docs/UI_DESIGN.md` + `ios-app/Sources/DesignSystem.swift` + the inline page in `obs-plugin/src/web-control.c` |
+| A phone-health (telemetry) STATE key or value | `docs/PROTOCOL.md` "Telemetry" + `ios-app/Sources/Telemetry.swift` + `obs-plugin/src/camera-state.h`/`.c` (+ their tests); keep `systemPressure` (camera) and `thermalState` (device) separate |
 | Any plugin-visible or web panel string | `obs-plugin/data/locale/en-US.ini` (web panel keys are `Web.*`, also listed in `web_text_keys[]` in `web-control.c`) + the same key in every other `.ini` there |
 | Any user-visible app string | the English key in `ios-app/Sources/Localization/en.lproj/Localizable.strings` (or `BroadcastExtension/en.lproj/` for the extension) + every other `.lproj`. SwiftUI literals localize themselves; everything else goes through `L()`; never interpolate into a localized string |
 | A website shell string | `site/i18n/en.json` + every other `site/i18n/*.json` (edited English pages just go stale in their translations, which is expected) |

@@ -96,6 +96,38 @@ A small length-prefixed packet protocol over one TCP connection (video is
 H.264/HEVC Annex B access units; timestamps in nanoseconds). Full spec in
 [`docs/PROTOCOL.md`](PROTOCOL.md).
 
+## Phone telemetry
+
+The phone reports battery, Low Power Mode, whole-device thermal state and
+the camera's system pressure in its STATE snapshot
+([`PROTOCOL.md` §8](PROTOCOL.md), "Telemetry") — reporting only, with no
+effect on capture. `systemPressure` (the camera) and `thermalState` (the
+device) are different signals and are never merged.
+
+```
+ProcessInfo thermal notification ─┐
+BatteryMonitor (level/plug/LPM)  ─┼→ Streamer.telemetry → scheduleStateSend() → STATE
+camera's pressure observation    ─┘   (StreamTelemetry)
+```
+
+- **iOS:** `Streamer` keeps one `StreamTelemetry` (`Telemetry.swift`) and
+  schedules the existing debounced STATE only when it changes; there is
+  no timer. The camera's one `systemPressureState` observation
+  (`CameraManager`) feeds both the pre-existing mitigation and the
+  telemetry — don't add a second observer. Battery and thermal state are
+  watched only while an OBS connection is up (a `BatteryMonitor` lease
+  taken by `Streamer`, independent of the Live screen's). An idle app in
+  standby sends a telemetry-only STATE.
+- **Plugin:** `camera-state.c` parses it into `struct lenslink_telemetry`
+  (every field unknown until reported; nothing clamped), the registry
+  carries it in `lenslink_source_info`, and `lenslink_telemetry_*` helpers
+  classify severity and pressure cause. Surfaces read those; none parses
+  JSON. `/api/state` serves the raw fields as it always served STATE.
+- **Tests:** `obs-plugin/tests` covers the parser, derivations and
+  registry (including under ASan/UBSan/TSan); `ios-app/Tests/run-telemetry-tests.sh`
+  (macOS, Xcode, opt-in) runs the platform-enum mapping tests in the
+  iOS Simulator.
+
 ## Continuous integration
 
 Pull requests run [`.github/workflows/build.yml`](../.github/workflows/build.yml),

@@ -35,6 +35,17 @@ should add as close to zero as possible.
   20-byte header prefix (`StreamClient.sendVideoOnQueue`).
 - Backpressure drops frames rather than queueing them (bounded memory,
   bounded latency), and adaptive bitrate reacts to send-delay/drops.
+- **Phone telemetry is event-driven and connection-scoped** (STATE
+  battery / thermal / pressure fields, `docs/PROTOCOL.md` §8): no timer.
+  `BatteryMonitor` (a device-wide flag, so refcounted) is retained by
+  `Streamer` only while an OBS connection is up, and the ProcessInfo
+  thermal observer lives and dies with it; nothing is watched when no
+  one is listening. The camera's pressure observation is the one that
+  already existed for throttling — telemetry reads the same callback.
+  Changes go out through the existing 200 ms STATE debounce, and an
+  unchanged standby snapshot isn't resent. Reporting Low Power Mode or
+  thermal state changes no capture behaviour; adapting to them would be
+  a separate, measured change.
 - **Dimmed = GPU idle:** the dim overlay disables the preview layer's
   connection, so no preview frames are rendered under the near-black
   cover (`CameraPreviewView.previewEnabled`). The outgoing stream is

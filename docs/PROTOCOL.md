@@ -271,7 +271,10 @@ plugin sends `stop_stream` before dropping the connection on hide and
 
 ### 8 — STATE (app → plugin)
 Camera-state snapshot, sent (debounced ~200 ms) whenever a control value
-changes and once on connect. Payload: UTF-8 JSON, e.g.
+changes and once on connect. While the app is idle in standby it sends a
+**telemetry-only** snapshot instead (see "Telemetry" below) — just the
+phone-health keys, none of the camera controls — once on connect and
+again whenever a telemetry value changes. Payload: UTF-8 JSON, e.g.
 
 ```json
 { "zoom": 2.5, "maxZoom": 10, "exposureBias": -0.5,
@@ -326,6 +329,75 @@ snapshot additionally carries `micEnabled: true`, the selected `mic` id,
 and the selectable `mics` list (`[{ "id", "name" }, …]`) for the `mic`
 command's pickers. Absent otherwise, so remote UIs key their mic row off
 `micEnabled`.
+
+#### Telemetry (phone health)
+
+The snapshot also reports the phone's power and capture health, so an
+operator can see a camera dying or being throttled before the picture
+suffers. Every key is optional and **absence means unknown or
+unsupported** — an older app sends none of them, and a receiver must never
+substitute a default (no "nominal", no "0%", no "off").
+
+| Key | Type | Values |
+|-----|------|--------|
+| `batteryPercent` | integer | `0`–`100`. Omitted when iOS won't say; never `-1`. |
+| `batteryState` | string | `unplugged`, `charging`, `full`, `unknown` |
+| `lowPowerMode` | bool | `true` / `false` (Low Power Mode is on / off). Sent as an explicit `false`, unlike the flags above: absent means "not reported". |
+| `thermalState` | string | `nominal`, `fair`, `serious`, `critical` |
+| `systemPressure` | string | `nominal`, `fair`, `serious`, `critical`, `shutdown` |
+| `systemPressureFactors` | array of strings | any of `systemTemperature`, `cameraTemperature`, `depthModuleTemperature`, `peakPower`, `batteryStress`. Sent only when non-empty, and only alongside `systemPressure`. |
+
+The values are stable English tokens — never localized, never a
+platform's description string; a UI translates them for display only.
+
+**`systemPressure` is not `thermalState`.** They are different facts and
+must not be merged or one used to label the other:
+
+- `thermalState` is the *whole device's* thermal condition
+  (`ProcessInfo.thermalState`).
+- `systemPressure` is the *camera's* pressure
+  (`AVCaptureDevice.systemPressureState`) — the signal the app's own
+  mitigation already reacts to (`serious` halves the bitrate, `critical`
+  quarters it and halves the frame rate; `shutdown` means iOS has stopped
+  the capture device and the session is interrupted). It describes the
+  active capture device, so it is absent until a camera has been
+  configured. `systemPressureFactors` says *why*: the three temperature
+  factors are heat; `peakPower` and `batteryStress` (the phone is about
+  to shut down at the current load) are power. A `serious` pressure with
+  only `peakPower` is a power problem on a cool phone, and a pressure
+  with no factors at all says nothing about heat — so name it "camera
+  system pressure", never "thermal", unless a temperature factor is
+  present.
+
+`lowPowerMode` is the platform's own flag, not inferred from the battery
+level, and the battery level is never inferred from it: 74% with Low Power
+Mode on is information, not a low battery. The facts stay separate on the
+wire; how loudly to present them is the receiver's call. The plugin's own
+classification (`camera-state.h`) treats *battery ≤ 20% and unplugged*,
+`thermalState` or `systemPressure` at `serious` as a warning;
+`thermalState` at `critical` and `systemPressure` at `critical` or
+`shutdown` as a strong warning; and Low Power Mode alone as information.
+The 20% is the phone's own low-battery threshold.
+
+Receivers validate rather than repair: an out-of-range or fractional
+`batteryPercent` (140 is not 100), an unknown string, or a value of the
+wrong type makes *that field* unknown, never the snapshot; unknown
+`systemPressureFactors` entries are ignored; factors without a
+`systemPressure` are dropped. A key that appears twice takes its last
+value, whatever its type. The plugin drops a connection's telemetry with
+the connection.
+
+Reporting only: none of this changes what the app captures or encodes. In
+particular Low Power Mode and `thermalState` do not change quality, codec
+or bitrate; only the pre-existing `systemPressure` mitigation does.
+
+Size: the fields add about 120 bytes to a snapshot (896 vs 777 bytes for a
+typical one) and at most 242 more in a worst-case pressure episode with
+every factor set (1540 vs 1298 for the largest snapshot — every lens,
+format, mic and green-screen key). The plugin's STATE cache is 2048 bytes;
+a receiver from before it grew silently truncates past 1023 (see above),
+which the *typical* snapshot still clears (1019 bytes worst case).
+Measure before adding keys.
 
 ### 9 — AUDIO (app → plugin)
 Reference audio for lip-sync auto-calibration. Payload: raw **16 kHz mono

@@ -48,12 +48,16 @@ soak: iOS throttles, capture stutters, and at worst the phone shuts
 down mid-stream. **Shipped (PR #63):** the capture device's
 `systemPressureState` is observed per Apple's guidance — `.serious`
 halves the bitrate, `.critical` quarters it and halves the frame rate,
-both restored on recovery, logged to the unified log. **Remaining:**
-surface the adaptation in the app status and the OBS source status
-(today it's silent), consider `ProcessInfo.thermalState` for
-earlier/coarser signals, resolution step-down as the last rung, and
-optionally respect Low Power Mode. *The biggest real-world win for
-long streams.*
+both restored on recovery, logged to the unified log. **Also shipped:**
+the phone now *reports* battery, Low Power Mode, `ProcessInfo.thermalState`
+and the camera's pressure level and factors to OBS in STATE
+([`PROTOCOL.md` §8](PROTOCOL.md), "Telemetry") — visibility only, with the
+mitigation unchanged. **Remaining:** show that in the OBS UI and the app
+status (the plugin exposes it typed; nothing presents it yet), consider
+`ProcessInfo.thermalState` for earlier/coarser *adaptation* (measure
+first — it is reported now, not acted on), resolution step-down as the
+last rung, and optionally respect Low Power Mode. *The biggest real-world
+win for long streams.*
 
 ### Optional pairing & encryption — close the trusted-LAN caveat — P1, medium
 The README honestly says the stream is unencrypted and intended for
